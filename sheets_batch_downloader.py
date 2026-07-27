@@ -19,7 +19,16 @@ SCOPES = [
 ]
 
 
+def default_token_path() -> str:
+    """统一 token 路径，避免换目录/exe 后反复授权。"""
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    folder = os.path.join(base, "DIYDownloader")
+    os.makedirs(folder, exist_ok=True)
+    return os.path.join(folder, "token.json")
+
+
 def token_has_required_scopes(token_path: str) -> bool:
+    """检查 token 是否已具备表格 + Drive 写权限（授权一次即可复用）。"""
     if not os.path.exists(token_path):
         return False
     try:
@@ -28,7 +37,14 @@ def token_has_required_scopes(token_path: str) -> bool:
         token_scopes = data.get("scopes") or data.get("scope") or []
         if isinstance(token_scopes, str):
             token_scopes = token_scopes.split()
-        return all(scope in token_scopes for scope in SCOPES)
+        have = set(token_scopes)
+        has_sheets = "https://www.googleapis.com/auth/spreadsheets" in have
+        # full drive 或 drive.file 均可上传
+        has_drive = (
+            "https://www.googleapis.com/auth/drive" in have
+            or "https://www.googleapis.com/auth/drive.file" in have
+        )
+        return has_sheets and has_drive
     except Exception:
         return False
 
@@ -358,17 +374,39 @@ class GoogleClient:
             self.account_label = credentials_info.get("client_email", "service_account")
         else:
             creds = None
-            if token_has_required_scopes(token_path):
-                creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+            # 优先复用已授权 token（刷新即可，不弹浏览器）
+            if os.path.exists(token_path):
+                try:
+                    creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+                except Exception:
+                    creds = None
 
-            if not creds or not creds.valid:
-                if creds and creds.expired and creds.refresh_token:
-                    creds.refresh(GoogleAuthRequest())
+            need_browser = False
+            if not creds:
+                need_browser = True
+            elif not creds.valid:
+                if creds.refresh_token:
+                    try:
+                        creds.refresh(GoogleAuthRequest())
+                    except Exception:
+                        need_browser = True
                 else:
-                    flow = InstalledAppFlow.from_client_secrets_file(credentials_path, SCOPES)
-                    creds = flow.run_local_server(port=0)
+                    need_browser = True
+            elif not token_has_required_scopes(token_path):
+                # 旧 token 权限不够（例如只有 drive.readonly）才重新授权一次
+                need_browser = True
+
+            if need_browser:
+                flow = InstalledAppFlow.from_client_secrets_file(credentials_path, SCOPES)
+                creds = flow.run_local_server(port=0)
+
+            # 持久化，下次直接用
+            try:
+                os.makedirs(os.path.dirname(os.path.abspath(token_path)) or ".", exist_ok=True)
                 with open(token_path, "w", encoding="utf-8") as f:
                     f.write(creds.to_json())
+            except Exception:
+                pass
 
             self.creds = creds
             self.account_label = "OAuth 用户"

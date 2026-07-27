@@ -9,12 +9,13 @@ from html import unescape
 from html.parser import HTMLParser
 
 from PySide6.QtCore import QThread, Qt, Signal, QUrl
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -25,6 +26,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QTabWidget,
     QTableWidget,
@@ -38,6 +40,7 @@ from sheets_batch_downloader import (
     GoogleClient,
     DownloadItem,
     PublicDownloader,
+    default_token_path,
     extract_drive_file_info,
     extension_from_name,
     find_url_in_text,
@@ -497,7 +500,16 @@ class MainWindow(QMainWindow):
         self.config_queue = []
         self.running_all_configs = False
         self.preview_pasted_items = []
-        self.token_file_path = os.path.join(app_base_dir(), "token.json")
+        # 固定到 %LOCALAPPDATA%\DIYDownloader\token.json，授权一次后各页共用
+        self.token_file_path = default_token_path()
+        # 迁移旧目录下的 token
+        legacy_token = os.path.join(app_base_dir(), "token.json")
+        if not os.path.exists(self.token_file_path) and os.path.exists(legacy_token):
+            try:
+                import shutil
+                shutil.copy2(legacy_token, self.token_file_path)
+            except Exception:
+                pass
         self.config_file_path = os.path.join(app_base_dir(), "diy_downloader_configs.json")
         self.configs = {}
         self.pending_release = None
@@ -516,19 +528,28 @@ class MainWindow(QMainWindow):
         root_layout.setSpacing(10)
         self.setCentralWidget(root)
 
+        # ========== 顶部标题栏（导航保持 Tab，不改成侧栏）==========
         header = QHBoxLayout()
         header.setSpacing(10)
         root_layout.addLayout(header)
 
         title = QLabel(APP_NAME)
         title.setObjectName("title")
-        subtitle = QLabel(f"v{APP_VERSION} · 表格下载 · 视频下载 · 云端上传 · 自动更新")
+        subtitle = QLabel(f"v{APP_VERSION} · 表格下载 · 视频下载 · 云端上传")
         subtitle.setObjectName("subtitle")
         title_box = QVBoxLayout()
         title_box.setSpacing(1)
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
         header.addLayout(title_box, 1)
+
+        # 全局凭据：独立设置板块，入口在「暗黑模式」左侧（不在表格下载里）
+        self.credentials_edit = QLineEdit(self._load_global_credentials())
+        self.credentials_edit.setPlaceholderText("Google API 凭据 JSON 路径")
+        self.global_settings_btn = QPushButton("⚙ 全局设置")
+        self.global_settings_btn.setObjectName("secondaryButton")
+        self.global_settings_btn.setToolTip("配置各功能共用的 Google 凭据（不放在表格下载里）")
+        self.global_settings_btn.clicked.connect(self.open_global_settings)
 
         self.theme_check = QCheckBox("暗黑模式")
         self.theme_check.setChecked(True)
@@ -538,6 +559,7 @@ class MainWindow(QMainWindow):
         self.guide_btn.setObjectName("ghostButton")
         self.help_btn = QPushButton("查看帮助")
         self.help_btn.setObjectName("ghostButton")
+        header.addWidget(self.global_settings_btn)
         header.addWidget(self.theme_check)
         header.addWidget(self.update_btn)
         header.addWidget(self.guide_btn)
@@ -547,26 +569,45 @@ class MainWindow(QMainWindow):
         self.main_tabs.setObjectName("mainTabs")
         root_layout.addWidget(self.main_tabs, 1)
 
+        # ========== 页 0：表格下载 — 左设置 / 右预览+日志 ==========
         sheets_page = QWidget()
-        sheets_layout = QVBoxLayout(sheets_page)
-        sheets_layout.setContentsMargins(12, 12, 12, 12)
-        sheets_layout.setSpacing(10)
+        sheets_page.setObjectName("pageFill")
+        sheets_page.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        sheets_h = QHBoxLayout(sheets_page)
+        sheets_h.setContentsMargins(8, 8, 8, 8)
+        sheets_h.setSpacing(12)
         self.main_tabs.addTab(sheets_page, "表格 / 粘贴链接")
 
-        self.video_page = VideoBatchPage()
-        self.main_tabs.addTab(self.video_page, "YouTube / FB 视频")
+        sheets_left_scroll = QScrollArea()
+        sheets_left_scroll.setObjectName("pageFill")
+        sheets_left_scroll.setWidgetResizable(True)
+        sheets_left_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        sheets_left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        sheets_left_scroll.setMinimumWidth(340)
+        sheets_left_scroll.setMaximumWidth(420)
+        sheets_left_inner = QWidget()
+        sheets_left_inner.setObjectName("scrollInner")
+        sheets_left_inner.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        sheets_left = QVBoxLayout(sheets_left_inner)
+        sheets_left.setContentsMargins(0, 0, 4, 0)
+        sheets_left.setSpacing(10)
+        sheets_left_scroll.setWidget(sheets_left_inner)
+        sheets_h.addWidget(sheets_left_scroll)
 
         compact_panel = QFrame()
         compact_panel.setObjectName("compactPanel")
-        panel_layout = QGridLayout(compact_panel)
+        panel_layout = QVBoxLayout(compact_panel)
         panel_layout.setContentsMargins(14, 12, 14, 12)
-        panel_layout.setHorizontalSpacing(10)
-        panel_layout.setVerticalSpacing(8)
-        sheets_layout.addWidget(compact_panel)
+        panel_layout.setSpacing(8)
+        sheets_left.addWidget(compact_panel)
 
-        self.credentials_edit = QLineEdit(default_credentials_path())
+        cfg_title = QLabel("下载设置")
+        cfg_title.setObjectName("cardTitle")
+        panel_layout.addWidget(cfg_title)
+
         self.output_edit = QLineEdit(os.path.join(os.path.expanduser("~"), "Downloads", "批量下载"))
         self.spreadsheet_edit = QLineEdit()
+        self.spreadsheet_edit.setPlaceholderText("Google 表格 ID")
         self.sheet_combo = QComboBox()
         self.name_col_edit = QLineEdit("A")
         self.link_col_edit = QLineEdit("P")
@@ -584,38 +625,70 @@ class MainWindow(QMainWindow):
         self.keyword_edit = QLineEdit()
         self.keyword_edit.setPlaceholderText("例如：张三 或 张三-李四")
         self.config_combo = QComboBox()
-        self.config_combo.setMinimumWidth(150)
         self.config_name_edit = QLineEdit()
         self.config_name_edit.setPlaceholderText("方案名称")
         self.save_config_btn = QPushButton("保存方案")
         self.save_config_btn.setObjectName("primaryButton")
         self.delete_config_btn = QPushButton("删除方案")
         self.delete_config_btn.setObjectName("ghostButton")
-
-        self.add_compact_field(panel_layout, "配置", self.config_combo, 0, 0)
-        self.add_compact_field(panel_layout, "方案名", self.config_name_edit, 0, 1, 1, 2)
-        panel_layout.addWidget(self.save_config_btn, 0, 3)
-        panel_layout.addWidget(self.delete_config_btn, 0, 4)
         self.run_all_btn = QPushButton("执行所有方案")
         self.run_all_btn.setObjectName("secondaryButton")
-        panel_layout.addWidget(self.run_all_btn, 0, 5)
 
-        self.add_compact_field(panel_layout, "凭据文件", self.credentials_edit, 1, 0, 1, 3)
-        self.add_button(panel_layout, "选择", self.choose_credentials, 1, 3)
-        self.add_compact_field(panel_layout, "下载目录", self.output_edit, 1, 4, 1, 3)
-        self.add_button(panel_layout, "选择", self.choose_output_dir, 1, 7)
+        def add_v(label, w):
+            cap = QLabel(label)
+            cap.setObjectName("fieldLabel")
+            panel_layout.addWidget(cap)
+            panel_layout.addWidget(w)
 
-        self.add_compact_field(panel_layout, "表格 ID", self.spreadsheet_edit, 2, 0, 1, 3)
-        self.add_button(panel_layout, "加载工作表", self.load_sheets, 2, 3)
-        self.add_compact_field(panel_layout, "工作表", self.sheet_combo, 2, 4, 1, 2)
-        self.add_compact_field(panel_layout, "名称列", self.name_col_edit, 2, 6)
-        self.add_compact_field(panel_layout, "链接列", self.link_col_edit, 2, 7)
+        add_v("配置方案", self.config_combo)
+        add_v("方案名", self.config_name_edit)
+        cfg_btns = QHBoxLayout()
+        cfg_btns.addWidget(self.save_config_btn)
+        cfg_btns.addWidget(self.delete_config_btn)
+        panel_layout.addLayout(cfg_btns)
+        panel_layout.addWidget(self.run_all_btn)
 
-        self.add_compact_field(panel_layout, "起始行", self.start_spin, 3, 0)
-        self.add_compact_field(panel_layout, "结束行", self.end_spin, 3, 1)
-        self.add_compact_field(panel_layout, "文件夹命名", self.folder_mode_combo, 3, 2, 1, 2)
-        self.add_compact_field(panel_layout, "只下载包含", self.keyword_edit, 3, 4, 1, 2)
-        self.add_compact_field(panel_layout, "回填列", self.backfill_col_edit, 3, 6)
+        cap = QLabel("下载目录")
+        cap.setObjectName("fieldLabel")
+        panel_layout.addWidget(cap)
+        out_row = QHBoxLayout()
+        out_row.addWidget(self.output_edit, 1)
+        out_pick = QPushButton("选择")
+        out_pick.setObjectName("secondaryButton")
+        out_pick.clicked.connect(self.choose_output_dir)
+        out_row.addWidget(out_pick)
+        panel_layout.addLayout(out_row)
+
+        add_v("表格 ID", self.spreadsheet_edit)
+        load_row = QHBoxLayout()
+        load_btn = QPushButton("加载工作表")
+        load_btn.setObjectName("secondaryButton")
+        load_btn.clicked.connect(self.load_sheets)
+        load_row.addWidget(load_btn)
+        panel_layout.addLayout(load_row)
+        add_v("工作表", self.sheet_combo)
+
+        cols = QHBoxLayout()
+        for lab, w in (("名称列", self.name_col_edit), ("链接列", self.link_col_edit), ("回填列", self.backfill_col_edit)):
+            box = QVBoxLayout()
+            c = QLabel(lab)
+            c.setObjectName("fieldLabel")
+            box.addWidget(c)
+            box.addWidget(w)
+            cols.addLayout(box)
+        panel_layout.addLayout(cols)
+
+        rows = QHBoxLayout()
+        for lab, w in (("起始行", self.start_spin), ("结束行", self.end_spin)):
+            box = QVBoxLayout()
+            c = QLabel(lab)
+            c.setObjectName("fieldLabel")
+            box.addWidget(c)
+            box.addWidget(w)
+            rows.addLayout(box)
+        panel_layout.addLayout(rows)
+        add_v("文件夹命名", self.folder_mode_combo)
+        add_v("只下载包含", self.keyword_edit)
 
         self.scan_all_check = QCheckBox("扫描整个工作表")
         self.scan_all_check.setChecked(True)
@@ -623,22 +696,10 @@ class MainWindow(QMainWindow):
         self.skip_existing_check.setChecked(True)
         self.backfill_check = QCheckBox("下载成功后回填表格")
         self.backfill_check.setChecked(True)
-        options = QHBoxLayout()
-        options.setSpacing(12)
-        options.addWidget(self.scan_all_check)
-        options.addWidget(self.skip_existing_check)
-        options.addWidget(self.backfill_check)
-        options.addStretch()
-        panel_layout.addLayout(options, 3, 7)
+        panel_layout.addWidget(self.scan_all_check)
+        panel_layout.addWidget(self.skip_existing_check)
+        panel_layout.addWidget(self.backfill_check)
 
-        for col in range(8):
-            panel_layout.setColumnStretch(col, 1)
-        panel_layout.setColumnStretch(2, 2)
-        panel_layout.setColumnStretch(5, 2)
-
-        actions = QHBoxLayout()
-        actions.setSpacing(8)
-        sheets_layout.addLayout(actions)
         self.refresh_btn = QPushButton("刷新表格")
         self.refresh_btn.setObjectName("secondaryButton")
         self.preview_btn = QPushButton("预览读取")
@@ -654,22 +715,19 @@ class MainWindow(QMainWindow):
         self.paste_links_btn.setObjectName("secondaryButton")
         self.clear_log_btn = QPushButton("清空日志")
         self.clear_log_btn.setObjectName("ghostButton")
-        actions.addWidget(self.refresh_btn)
-        actions.addWidget(self.preview_btn)
-        actions.addWidget(self.start_btn)
-        actions.addWidget(self.stop_btn)
-        actions.addWidget(self.paste_links_btn)
-        actions.addWidget(self.open_folder_btn)
-        actions.addWidget(self.clear_log_btn)
-        actions.addStretch()
+        for b in (
+            self.refresh_btn, self.preview_btn, self.start_btn, self.stop_btn,
+            self.paste_links_btn, self.open_folder_btn, self.clear_log_btn,
+        ):
+            panel_layout.addWidget(b)
+        sheets_left.addStretch(1)
 
-        bottom = QHBoxLayout()
-        bottom.setSpacing(10)
-        sheets_layout.addLayout(bottom, 4)
+        sheets_right = QVBoxLayout()
+        sheets_h.addLayout(sheets_right, 1)
         preview_card = Card("预览")
         log_card = Card("日志")
-        bottom.addWidget(preview_card, 7)
-        bottom.addWidget(log_card, 3)
+        sheets_right.addWidget(preview_card, 3)
+        sheets_right.addWidget(log_card, 2)
 
         self.preview_table = QTableWidget(0, 7)
         self.preview_table.setHorizontalHeaderLabels(["行号", "文件夹", "回填名", "源文件名", "A列名称", "链接状态", "链接"])
@@ -689,13 +747,25 @@ class MainWindow(QMainWindow):
 
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
-        self.log_box.setMinimumWidth(420)
         log_card.layout.addWidget(self.log_box)
 
         self.status_row = QLabel("等待开始")
         self.status_row.setObjectName("status")
-        sheets_layout.addWidget(self.status_row)
+        sheets_right.addWidget(self.status_row)
 
+        # ========== 页 1：视频（板块内左右由 VideoBatchPage 负责）==========
+        self.video_page = VideoBatchPage()
+        self.main_tabs.addTab(self.video_page, "YouTube / FB 视频")
+
+        # ========== 页 2：上传（左设置 / 右任务进度回执）==========
+        self.upload_page = DriveBatchUploadPage(
+            credentials_supplier=lambda: self.credentials_edit.text().strip(),
+            token_path=self.token_file_path,
+        )
+        self.main_tabs.addTab(self.upload_page, "批量上传云端")
+
+        # 信号
+        self.main_tabs.currentChanged.connect(self._on_tab_changed)
         self.preview_btn.clicked.connect(self.preview_items)
         self.refresh_btn.clicked.connect(self.refresh_sheet_info)
         self.start_btn.clicked.connect(self.start_download)
@@ -712,14 +782,20 @@ class MainWindow(QMainWindow):
         self.save_config_btn.clicked.connect(self.save_current_config)
         self.delete_config_btn.clicked.connect(self.delete_current_config)
         self.run_all_btn.clicked.connect(self.start_all_configs)
+        # 仅同步共用凭据路径；上传表格 ID 独立，不从下载页回写
+        self.credentials_edit.textChanged.connect(self._notify_shared_credentials)
 
-        # 上传页依赖主界面凭据/表格控件，须在其创建之后挂载
-        self.upload_page = DriveBatchUploadPage(
-            credentials_supplier=lambda: self.credentials_edit.text().strip(),
-            spreadsheet_supplier=lambda: self.spreadsheet_edit.text().strip(),
-            token_path=self.token_file_path,
-        )
-        self.main_tabs.addTab(self.upload_page, "批量上传云端")
+    def _on_tab_changed(self, index: int):
+        # 切到上传页时只刷新共用凭据显示（表格 ID 各自独立）
+        if index == 2 and hasattr(self, "upload_page"):
+            self.upload_page.refresh_credentials_label()
+
+    def _notify_shared_credentials(self, *_args):
+        if hasattr(self, "upload_page"):
+            try:
+                self.upload_page.refresh_credentials_label()
+            except Exception:
+                pass
 
     def add_file_row(self, layout, label, edit, handler, button_text="选择"):
         row = QHBoxLayout()
@@ -845,7 +921,11 @@ class MainWindow(QMainWindow):
             return
         cfg = self.configs[name]
         self.config_name_edit.setText(name)
-        self.credentials_edit.setText(cfg.get("credentials", self.credentials_edit.text()))
+        # 旧方案可能带凭据路径：写入全局凭据，不再在下载页展示
+        if cfg.get("credentials"):
+            self.credentials_edit.setText(cfg.get("credentials", self.credentials_edit.text()))
+            self._save_global_credentials()
+            self._notify_shared_credentials()
         self.output_edit.setText(cfg.get("output_dir", self.output_edit.text()))
         self.spreadsheet_edit.setText(cfg.get("spreadsheet_id", ""))
         saved_sheet = cfg.get("sheet_name", "")
@@ -867,30 +947,183 @@ class MainWindow(QMainWindow):
         self.backfill_check.setChecked(bool(cfg.get("backfill", True)))
         self.log(f"已切换配置方案：{name}")
 
-    def apply_style(self):
-        dropdown_arrow = asset_path("dropdown_arrow.svg")
-        checkmark = asset_path("checkmark.svg")
+    @staticmethod
+    def _fill_widget_bg(widget: QWidget, color: str):
+        """Force solid background — QScrollArea viewport on Windows defaults to white Base."""
+        if widget is None:
+            return
+        c = QColor(color)
+        widget.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        widget.setAutoFillBackground(True)
+        pal = widget.palette()
+        pal.setColor(QPalette.ColorRole.Window, c)
+        pal.setColor(QPalette.ColorRole.Base, c)
+        pal.setColor(QPalette.ColorRole.Button, c)
+        widget.setPalette(pal)
+
+    def _paint_scroll_areas(self, bg: str):
+        """Kill residual white bands inside any QScrollArea (viewport + inner page)."""
+        for scroll in self.findChildren(QScrollArea):
+            scroll.setFrameShape(QFrame.Shape.NoFrame)
+            # Clear any local "transparent" sheet that lets Windows white Base show through
+            scroll.setStyleSheet("")
+            self._fill_widget_bg(scroll, bg)
+            vp = scroll.viewport()
+            if vp is not None:
+                vp.setStyleSheet("")
+                self._fill_widget_bg(vp, bg)
+            inner = scroll.widget()
+            if inner is not None:
+                # Do not set a local stylesheet on inner — it would block card styles
+                self._fill_widget_bg(inner, bg)
+
+        for name in ("pageFill", "scrollInner", "rootWidget"):
+            for w in self.findChildren(QWidget, name):
+                self._fill_widget_bg(w, bg)
+
+    def theme_colors(self):
+        """Current theme palette (shared by main window + dialogs)."""
         dark = not hasattr(self, "theme_check") or self.theme_check.isChecked()
         if dark:
-            colors = {
+            return {
                 "bg": "#0b1120", "panel": "#111a2e", "panel2": "#0d1628", "line": "#263855",
                 "text": "#d4deec", "muted": "#93a4ba", "title": "#e8eef8", "accent": "#2f6df6",
                 "accent2": "#38bdf8", "soft": "#16243b", "table": "#0a1324", "table_alt": "#101b31",
                 "header": "#172743", "danger": "#7f1d1d", "danger_border": "#ef4444", "log": "#050b16",
-                "dialog_bg": "#f8fafc", "dialog_text": "#172033",
+                # 弹窗与主界面同色系，避免白底 + 浅色字看不清
+                "dialog_bg": "#0f172a", "dialog_text": "#e8eef8", "dialog_muted": "#93a4ba",
+                "dialog_panel": "#1e293b", "dialog_input": "#0b1220",
             }
-        else:
-            colors = {
-                "bg": "#eef5fb", "panel": "#ffffff", "panel2": "#f7fbff", "line": "#c9d9ee",
-                "text": "#0f1f35", "muted": "#55708f", "title": "#10213a", "accent": "#2563eb",
-                "accent2": "#0ea5e9", "soft": "#eaf3ff", "table": "#ffffff", "table_alt": "#f3f8ff",
-                "header": "#e5f0ff", "danger": "#fee2e2", "danger_border": "#f87171", "log": "#08111f",
-                "dialog_bg": "#ffffff", "dialog_text": "#172033",
-            }
+        return {
+            "bg": "#eef5fb", "panel": "#ffffff", "panel2": "#f7fbff", "line": "#c9d9ee",
+            "text": "#0f1f35", "muted": "#55708f", "title": "#10213a", "accent": "#2563eb",
+            "accent2": "#0ea5e9", "soft": "#eaf3ff", "table": "#ffffff", "table_alt": "#f3f8ff",
+            "header": "#e5f0ff", "danger": "#fee2e2", "danger_border": "#f87171", "log": "#08111f",
+            "dialog_bg": "#ffffff", "dialog_text": "#0f1f35", "dialog_muted": "#55708f",
+            "dialog_panel": "#f1f5f9", "dialog_input": "#ffffff",
+        }
+
+    def dialog_stylesheet(self) -> str:
+        """High-contrast stylesheet for QDialog / QMessageBox."""
+        c = self.theme_colors()
+        return f'''
+            QDialog {{
+                background-color: {c["dialog_bg"]};
+                color: {c["dialog_text"]};
+                font-family: "Microsoft YaHei UI", "Microsoft YaHei", Arial, sans-serif;
+                font-size: 13px;
+            }}
+            QDialog QLabel {{
+                color: {c["dialog_text"]};
+                background: transparent;
+            }}
+            QDialog QLabel#cardTitle {{
+                color: {c["title"]};
+                font-size: 18px;
+                font-weight: 900;
+            }}
+            QDialog QLabel#subtitle {{
+                color: {c["dialog_muted"]};
+                font-size: 12px;
+            }}
+            QDialog QLabel#fieldLabel {{
+                color: {c["dialog_muted"]};
+                font-weight: 800;
+                font-size: 12px;
+            }}
+            QDialog QFrame#compactPanel, QDialog QFrame#card {{
+                background-color: {c["dialog_panel"]};
+                border: 1px solid {c["line"]};
+                border-radius: 12px;
+            }}
+            QDialog QLineEdit, QDialog QComboBox, QDialog QSpinBox, QDialog QTextEdit {{
+                background-color: {c["dialog_input"]};
+                color: {c["dialog_text"]};
+                border: 1px solid {c["line"]};
+                border-radius: 10px;
+                padding: 8px 10px;
+                selection-background-color: {c["accent"]};
+                selection-color: #ffffff;
+            }}
+            QDialog QLineEdit:focus {{
+                border: 1px solid {c["accent2"]};
+            }}
+            QDialog QLineEdit::placeholder {{
+                color: {c["dialog_muted"]};
+            }}
+            QDialog QPushButton {{
+                background-color: {c["accent"]};
+                color: #ffffff;
+                border: 0;
+                border-radius: 10px;
+                padding: 8px 16px;
+                font-weight: 800;
+                min-height: 28px;
+                min-width: 72px;
+            }}
+            QDialog QPushButton:hover {{
+                background-color: #1d4ed8;
+            }}
+            QDialog QPushButton#secondaryButton, QDialog QPushButton#ghostButton {{
+                background-color: {c["soft"]};
+                color: {c["dialog_text"]};
+                border: 1px solid {c["line"]};
+            }}
+            QDialog QPushButton#secondaryButton:hover, QDialog QPushButton#ghostButton:hover {{
+                border-color: {c["accent2"]};
+            }}
+            QDialog QDialogButtonBox QPushButton {{
+                background-color: {c["accent"]};
+                color: #ffffff;
+                border: 0;
+                border-radius: 10px;
+                padding: 8px 18px;
+                font-weight: 800;
+                min-width: 80px;
+            }}
+            QDialog QDialogButtonBox QPushButton:hover {{
+                background-color: #1d4ed8;
+            }}
+            QDialog QDialogButtonBox QPushButton#secondaryButton {{
+                background-color: {c["soft"]};
+                color: {c["dialog_text"]};
+                border: 1px solid {c["line"]};
+            }}
+            QDialog QDialogButtonBox QPushButton#secondaryButton:hover {{
+                border-color: {c["accent2"]};
+                background-color: {c["panel"]};
+            }}
+            QMessageBox {{
+                background-color: {c["dialog_bg"]};
+                color: {c["dialog_text"]};
+                font-family: "Microsoft YaHei UI", "Microsoft YaHei", Arial, sans-serif;
+            }}
+            QMessageBox QLabel {{
+                color: {c["dialog_text"]};
+                background: transparent;
+                font-size: 13px;
+            }}
+            QMessageBox QPushButton {{
+                background-color: {c["accent"]};
+                color: #ffffff;
+                border-radius: 9px;
+                padding: 6px 16px;
+                min-width: 72px;
+                font-weight: 800;
+            }}
+        '''
+
+    def apply_style(self):
+        dropdown_arrow = asset_path("dropdown_arrow.svg")
+        checkmark = asset_path("checkmark.svg")
+        dark = not hasattr(self, "theme_check") or self.theme_check.isChecked()
+        colors = self.theme_colors()
         danger_text = "#fee2e2" if dark else "#991b1b"
+        bg = colors["bg"]
         self.setStyleSheet(f'''
-            QMainWindow {{ background: {colors["bg"]}; color: {colors["text"]}; font-family: "Microsoft YaHei UI", "Microsoft YaHei", Arial, sans-serif; font-size: 13px; }}
-            QWidget#rootWidget {{ background: {colors["bg"]}; }}
+            QMainWindow {{ background-color: {bg}; color: {colors["text"]}; font-family: "Microsoft YaHei UI", "Microsoft YaHei", Arial, sans-serif; font-size: 13px; }}
+            QWidget#rootWidget {{ background-color: {bg}; }}
+            QWidget#pageFill, QWidget#scrollInner {{ background-color: {bg}; }}
             QLabel {{ background: transparent; color: {colors["text"]}; }}
             QLabel#title {{ font-size: 23px; font-weight: 900; color: {colors["title"]}; }}
             QLabel#subtitle {{ color: {colors["muted"]}; font-size: 12px; }}
@@ -915,19 +1148,36 @@ class MainWindow(QMainWindow):
             QPushButton#secondaryButton:hover, QPushButton#ghostButton:hover {{ border: 1px solid {colors["accent2"]}; }}
             QPushButton#ghostButton {{ background: transparent; color: {colors["text"]}; border: 1px solid {colors["line"]}; }}
             QPushButton#dangerButton {{ background: {colors["danger"]}; color: {danger_text}; border: 1px solid {colors["danger_border"]}; }}
-            QCheckBox {{ color: {colors["text"]}; font-weight: 800; spacing: 7px; }}
+            QCheckBox {{ color: {colors["text"]}; font-weight: 800; spacing: 7px; background: transparent; }}
             QCheckBox::indicator {{ width: 18px; height: 18px; border-radius: 5px; border: 1px solid {colors["line"]}; background: {colors["panel2"]}; }}
             QCheckBox::indicator:checked {{ image: url("{checkmark}"); background: {colors["accent"]}; border: 1px solid {colors["accent"]}; }}
             QTableWidget {{ background: {colors["table"]}; alternate-background-color: {colors["table_alt"]}; color: {colors["text"]}; border: 1px solid {colors["line"]}; border-radius: 10px; gridline-color: {colors["line"]}; selection-background-color: {colors["accent"]}; selection-color: #ffffff; font-size: 12px; }}
             QHeaderView::section {{ background: {colors["header"]}; color: {colors["text"]}; padding: 6px; border: 0; border-right: 1px solid {colors["line"]}; font-weight: 900; }}
             QTextEdit {{ background: {colors["log"]}; color: #66f5a1; border: 1px solid {colors["line"]}; border-radius: 12px; padding: 10px; font-family: Consolas, "Microsoft YaHei UI"; font-size: 12px; }}
             QTextEdit#pasteTextBox {{ background: {colors["panel2"]}; color: {colors["text"]}; border: 1px solid {colors["line"]}; border-radius: 12px; padding: 10px; font-family: "Microsoft YaHei UI", "Microsoft YaHei", Arial, sans-serif; font-size: 13px; }}
-            QLabel#status {{ color: {colors["muted"]}; font-weight: 800; }}
-            QTabWidget#mainTabs {{ background: transparent; }}
-            QTabWidget#mainTabs::pane {{ border: 1px solid {colors["line"]}; border-radius: 12px; top: -1px; background: {colors["panel"]}; }}
+            QLabel#status {{ color: {colors["muted"]}; font-weight: 800; background: transparent; }}
+            QTabWidget#mainTabs {{ background-color: {bg}; border: 0; }}
+            QTabWidget#mainTabs::pane {{ border: 1px solid {colors["line"]}; border-radius: 12px; top: -1px; background-color: {bg}; padding: 6px; }}
+            QTabBar {{ background: transparent; }}
             QTabWidget#mainTabs QTabBar::tab {{ background: {colors["soft"]}; color: {colors["muted"]}; border: 1px solid {colors["line"]}; border-bottom: 0; border-top-left-radius: 10px; border-top-right-radius: 10px; padding: 8px 18px; margin-right: 4px; font-weight: 800; min-width: 120px; }}
             QTabWidget#mainTabs QTabBar::tab:selected {{ background: {colors["panel"]}; color: {colors["title"]}; border-color: {colors["accent2"]}; }}
             QTabWidget#mainTabs QTabBar::tab:hover {{ color: {colors["title"]}; border-color: {colors["accent2"]}; }}
+            QProgressBar {{ border: 1px solid {colors["line"]}; border-radius: 8px; background: {colors["panel2"]}; text-align: center; color: {colors["text"]}; min-height: 18px; }}
+            QProgressBar::chunk {{ background: {colors["accent"]}; border-radius: 7px; }}
+            QFrame#uploadDropZone {{ background: {colors["soft"]}; border: 2px dashed {colors["accent2"]}; border-radius: 14px; }}
+            QFrame#uploadDropZone:hover {{ border-color: {colors["accent"]}; background: {colors["panel2"]}; }}
+            QFrame#settingsCard {{ background: {colors["panel"]}; border: 1px solid {colors["line"]}; border-radius: 14px; }}
+            QFrame#workCard {{ background: {colors["panel"]}; border: 1px solid {colors["line"]}; border-radius: 14px; }}
+            QToolButton#collapseBtn {{ background: {colors["soft"]}; color: {colors["text"]}; border: 1px solid {colors["line"]}; border-radius: 10px; padding: 8px 12px; font-weight: 800; text-align: left; }}
+            QToolButton#collapseBtn:hover {{ border-color: {colors["accent2"]}; }}
+            QToolButton#collapseBtn:checked {{ background: {colors["accent"]}; color: #ffffff; border-color: {colors["accent"]}; }}
+            QLabel#dropHint {{ color: {colors["muted"]}; font-size: 13px; font-weight: 700; background: transparent; }}
+            QScrollArea {{ background-color: {bg}; border: 0; }}
+            QScrollArea#pageFill {{ background-color: {bg}; border: 0; }}
+            QScrollArea#pageFill > QWidget {{ background-color: {bg}; }}
+            QScrollArea#pageFill > QWidget > QWidget#scrollInner {{ background-color: {bg}; }}
+            QDialog {{ background-color: {colors["dialog_bg"]}; color: {colors["dialog_text"]}; }}
+            QDialog QLabel {{ color: {colors["dialog_text"]}; background: transparent; }}
             QMessageBox {{ background: {colors["dialog_bg"]}; color: {colors["dialog_text"]}; font-family: "Microsoft YaHei UI", "Microsoft YaHei", Arial, sans-serif; }}
             QMessageBox QLabel {{ color: {colors["dialog_text"]}; background: transparent; font-size: 13px; }}
             QMessageBox QPushButton {{ background: {colors["accent"]}; color: #ffffff; border-radius: 9px; padding: 6px 16px; min-width: 64px; }}
@@ -935,15 +1185,162 @@ class MainWindow(QMainWindow):
             QScrollBar::handle:vertical, QScrollBar::handle:horizontal {{ background: {colors["line"]}; border-radius: 5px; min-height: 30px; min-width: 30px; }}
             QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; }}
         ''')
+        # Solid fill on scroll viewports / page shells — transparent was showing Windows white Base
+        self._fill_widget_bg(self, bg)
+        self._paint_scroll_areas(bg)
+        upload_page = getattr(self, "upload_page", None)
+        if upload_page is not None and hasattr(upload_page, "apply_page_fill"):
+            upload_page.apply_page_fill(bg)
 
     def log(self, message):
         now = time.strftime("%H:%M:%S")
         self.log_box.append(f"[{now}] {message}")
 
-    def choose_credentials(self):
-        path, _ = QFileDialog.getOpenFileName(self, "选择凭据 JSON", self.credentials_edit.text(), "JSON 文件 (*.json);;所有文件 (*.*)")
-        if path:
+    def global_settings_file(self) -> str:
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        folder = os.path.join(base, "DIYDownloader")
+        os.makedirs(folder, exist_ok=True)
+        return os.path.join(folder, "global_settings.json")
+
+    def _load_global_credentials(self) -> str:
+        path = self.global_settings_file()
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                cred = str(data.get("credentials", "") or "").strip()
+                if cred:
+                    return cred
+            except Exception:
+                pass
+        return default_credentials_path()
+
+    def _save_global_credentials(self, credentials_path: str = ""):
+        cred = (credentials_path or self.credentials_edit.text()).strip()
+        try:
+            with open(self.global_settings_file(), "w", encoding="utf-8") as f:
+                json.dump({"credentials": cred}, f, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            self.log(f"保存全局设置失败：{exc}")
+
+    def open_global_settings(self):
+        """顶部独立「全局设置」：凭据等共用项，不在表格下载页内。"""
+        colors = self.theme_colors()
+        dlg = QDialog(self)
+        dlg.setObjectName("globalSettingsDialog")
+        dlg.setWindowTitle("全局设置")
+        dlg.setMinimumWidth(580)
+        dlg.setModal(True)
+        # 独立完整样式，避免继承主窗口后出现「浅底 + 浅字」
+        dlg.setStyleSheet(self.dialog_stylesheet())
+        self._fill_widget_bg(dlg, colors["dialog_bg"])
+
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(20, 18, 20, 18)
+        lay.setSpacing(14)
+
+        title = QLabel("全局设置")
+        title.setObjectName("cardTitle")
+        lay.addWidget(title)
+
+        tip = QLabel(
+            "以下配置对全部功能共用：表格下载、批量上传云端等。\n"
+            "授权 token 固定保存在本机，授权一次后一般无需重复登录。"
+        )
+        tip.setObjectName("subtitle")
+        tip.setWordWrap(True)
+        lay.addWidget(tip)
+
+        card = QFrame()
+        card.setObjectName("compactPanel")
+        card_lay = QVBoxLayout(card)
+        card_lay.setContentsMargins(16, 14, 16, 14)
+        card_lay.setSpacing(10)
+
+        cap = QLabel("凭据文件（JSON）· 各功能共用")
+        cap.setObjectName("fieldLabel")
+        card_lay.addWidget(cap)
+
+        path_edit = QLineEdit(self.credentials_edit.text())
+        path_edit.setPlaceholderText("选择 Google OAuth / 服务账号凭据 JSON")
+        card_lay.addWidget(path_edit)
+
+        pick_row = QHBoxLayout()
+        pick_btn = QPushButton("选择凭据…")
+        pick_btn.setObjectName("secondaryButton")
+
+        def pick_file():
+            path, _ = QFileDialog.getOpenFileName(
+                dlg,
+                "选择凭据 JSON",
+                path_edit.text() or os.path.expanduser("~"),
+                "JSON 文件 (*.json);;所有文件 (*.*)",
+            )
+            if path:
+                path_edit.setText(path)
+
+        pick_btn.clicked.connect(pick_file)
+        pick_row.addWidget(pick_btn)
+        pick_row.addStretch(1)
+        card_lay.addLayout(pick_row)
+
+        token = getattr(self, "token_file_path", default_token_path())
+        token_ok = os.path.exists(token)
+        token_label = QLabel(
+            f"授权缓存：{token}\n"
+            + ("状态：已有 token，一般无需重新登录" if token_ok else "状态：尚未授权，首次使用会打开浏览器登录一次")
+        )
+        token_label.setObjectName("subtitle")
+        token_label.setWordWrap(True)
+        card_lay.addWidget(token_label)
+        lay.addWidget(card)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        save_btn = buttons.button(QDialogButtonBox.StandardButton.Save)
+        cancel_btn = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        save_btn.setText("保存")
+        cancel_btn.setText("取消")
+        # 取消用次要样式，保存用主按钮（默认蓝底白字）
+        cancel_btn.setObjectName("secondaryButton")
+        cancel_btn.setStyleSheet("")  # 交给 dialog stylesheet 的 secondary 规则
+        lay.addWidget(buttons)
+
+        def on_save():
+            path = path_edit.text().strip()
+            if not path:
+                box = QMessageBox(dlg)
+                box.setIcon(QMessageBox.Icon.Warning)
+                box.setWindowTitle("全局设置")
+                box.setText("请填写凭据文件路径。")
+                box.setStyleSheet(self.dialog_stylesheet())
+                box.exec()
+                return
+            if not os.path.exists(path):
+                box = QMessageBox(dlg)
+                box.setIcon(QMessageBox.Icon.Question)
+                box.setWindowTitle("全局设置")
+                box.setText(f"文件不存在：\n{path}\n\n仍要保存此路径吗？")
+                box.setStandardButtons(
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                box.setStyleSheet(self.dialog_stylesheet())
+                if box.exec() != QMessageBox.StandardButton.Yes:
+                    return
             self.credentials_edit.setText(path)
+            self._save_global_credentials(path)
+            self._notify_shared_credentials()
+            self.log(f"全局凭据已更新：{path}")
+            dlg.accept()
+
+        buttons.accepted.connect(on_save)
+        buttons.rejected.connect(dlg.reject)
+        dlg.exec()
+
+    def choose_credentials(self):
+        """兼容旧入口：打开全局设置。"""
+        self.open_global_settings()
 
     def choose_output_dir(self):
         path = QFileDialog.getExistingDirectory(self, "选择下载目录", self.output_edit.text())
@@ -963,8 +1360,11 @@ class MainWindow(QMainWindow):
             self,
             APP_TITLE,
             "使用步骤：\n"
+            "【全局设置】（标题栏「暗黑模式」左侧）\n"
+            "1. 点「⚙ 全局设置」选择 Google 凭据 JSON（各功能共用）。\n"
+            "2. 授权 token 保存在本机，授权一次后表格下载与云端上传可共用。\n\n"
             "【表格 / 粘贴链接】\n"
-            "1. 选择凭据文件和下载目录。\n"
+            "1. 在全局设置中选好凭据，再选下载目录。\n"
             "2. 填写 Google 表格 ID，点击“加载工作表”或“刷新表格”。\n"
             "3. 设置名称列、链接列、起止行、文件夹命名和回填列。\n"
             "4. 可在“只下载包含”输入人名，例如：张三 或 张三-李四。\n"
@@ -983,7 +1383,7 @@ class MainWindow(QMainWindow):
             "7. 建议安装 ffmpeg，以便最佳画质音视频合并。\n\n"
             "【批量上传云端】（独立板块）\n"
             "1. 切换到“批量上传云端”标签页。\n"
-            "2. 填写表格 ID、Drive 父文件夹 ID，加载「分类目录」。\n"
+            "2. 填写本页「上传专用表格 ID」（与下载页表格相互独立，不会自动共用）和 Drive 父文件夹 ID，加载「分类目录」。\n"
             "3. 选择分类模式或图片直传，选择本地文件，加入清单。\n"
             "4. 点「开始批量上传」：自动建文件夹、上传文件、写入入库表与上传日志。\n"
             "5. 若提示 Drive 权限不足，删除 token.json 后重新授权。"
@@ -1004,7 +1404,8 @@ class MainWindow(QMainWindow):
             "• 如果回填提示权限不足，删除 token.json 后重新授权即可。\n"
             "• YouTube / Facebook 视频板块基于 yt-dlp，与表格下载相互独立。\n"
             "• 支持 YouTube 单视频与播放列表、批量多链接、断点续传。\n"
-            "• Facebook 公开 Reels/视频可下载；可识别的清单会尝试展开，私密内容会失败。"
+            "• Facebook 公开 Reels/视频可下载；可识别的清单会尝试展开，私密内容会失败。\n"
+            "• 批量上传使用独立的表格 ID（入库表/分类目录），不与「表格下载」页共用表格。"
         )
 
     def refresh_sheet_info(self):
