@@ -1,14 +1,19 @@
-"""批量上传到 Google Drive + 写入入库表（对齐原 Apps Script 多任务上传流程）。"""
+"""批量上传到 Google Drive + 写入入库表（对齐原 Apps Script 多任务上传流程）。
+
+布局：左侧设置 / 右侧任务列表、进度与回执链接。
+凭据与主界面「表格下载」共用。
+视频类型来自「分类目录」表第 D 列（非写死列表）。
+"""
 
 from __future__ import annotations
 
 import mimetypes
 import os
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
 
 from PySide6.QtCore import QThread, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices
@@ -23,7 +28,9 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QProgressBar,
     QPushButton,
+    QScrollArea,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -39,7 +46,6 @@ DEFAULT_PARENT_FOLDER_ID = "1h4rHJ9dojSrK84BftxKnthJz7QuEgj3v"
 DATA_SHEET_NAME = "入库表"
 CATEGORY_SHEET_NAME = "分类目录"
 LOG_SHEET_NAME = "上传日志"
-VIDEO_TYPES = ["成片", "素材", "口播", "混剪", "其他"]
 
 
 @dataclass
@@ -65,7 +71,6 @@ class UploadTask:
 
 
 def app_base_dir() -> str:
-    import sys
     if getattr(sys, "frozen", False):
         return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.abspath(__file__))
@@ -88,8 +93,8 @@ class Card(QFrame):
         super().__init__()
         self.setObjectName("card")
         self.layout = QVBoxLayout(self)
-        self.layout.setContentsMargins(18, 16, 18, 16)
-        self.layout.setSpacing(10)
+        self.layout.setContentsMargins(16, 14, 16, 14)
+        self.layout.setSpacing(8)
         title_label = QLabel(title)
         title_label.setObjectName("cardTitle")
         self.layout.addWidget(title_label)
@@ -121,8 +126,8 @@ class CategoryLoadWorker(QThread):
 class UploadWorker(QThread):
     log = Signal(str)
     failed = Signal(str)
-    item_update = Signal(int, int, str, str)  # task_index, file_index, status, file_url
-    task_update = Signal(int, str, str)  # task_index, status, folder_url
+    item_update = Signal(int, int, str, str)
+    task_update = Signal(int, str, str)
     progress = Signal(int, int)
     done = Signal()
 
@@ -196,7 +201,6 @@ class UploadWorker(QThread):
                         break
                     self.item_update.emit(task.index, fi, "上传中", "")
                     try:
-                        # 已存在同名
                         existing = client.find_file_in_folder(folder_id, file_item.name)
                         if existing and self.skip_existing:
                             file_url = existing.get("webViewLink") or ""
@@ -205,12 +209,10 @@ class UploadWorker(QThread):
                             done_files += 1
                             self.progress.emit(done_files, total_files)
                             self.log.emit(f"已存在，跳过：{file_item.name}")
-                            # 仍写入入库表（与原脚本复用已存在文件一致，原脚本也会写表）
                             self._write_inbound(client, task, file_url)
                             continue
 
                         if existing and not self.skip_existing:
-                            # 仍复用已存在文件（对齐原脚本）
                             created = existing
                             self.log.emit(f"复用云端同名文件：{file_item.name}")
                         else:
@@ -274,28 +276,26 @@ class UploadWorker(QThread):
             display_cat1, display_cat2, display_cat3 = task.cat1, task.cat2 or "", task.cat3 or ""
             display_type = task.video_type or ""
         row = [
-            formatted,
-            display_cat1,
-            display_cat2,
-            display_cat3,
-            display_type,
-            "",
-            "",
-            task.uploader,
-            copyright_status,
-            file_url,
-            "已上传",
-            formatted,
+            formatted, display_cat1, display_cat2, display_cat3,
+            display_type, "", "", task.uploader,
+            copyright_status, file_url, "已上传", formatted,
         ]
         client.insert_inbound_row(self.spreadsheet_id, self.data_sheet, row, insert_before_row=7)
 
 
 class DriveBatchUploadPage(QWidget):
-    """独立板块：批量上传本地文件到 Google Drive，并写入入库表。"""
+    """左侧设置 · 右侧任务/进度/回执。凭据与主界面共用。"""
 
-    def __init__(self, parent=None, credentials_supplier=None, token_path: str = ""):
+    def __init__(
+        self,
+        parent=None,
+        credentials_supplier=None,
+        spreadsheet_supplier=None,
+        token_path: str = "",
+    ):
         super().__init__(parent)
-        self.credentials_supplier = credentials_supplier  # callable -> path
+        self.credentials_supplier = credentials_supplier
+        self.spreadsheet_supplier = spreadsheet_supplier
         self.token_path = token_path or os.path.join(app_base_dir(), "token.json")
         self.worker = None
         self.category_rows: list[list[str]] = []
@@ -309,10 +309,24 @@ class DriveBatchUploadPage(QWidget):
     def credentials_path(self) -> str:
         if callable(self.credentials_supplier):
             try:
-                return str(self.credentials_supplier() or "").strip()
+                value = str(self.credentials_supplier() or "").strip()
+                if value:
+                    return value
             except Exception:
                 pass
         return default_credentials_path()
+
+    def spreadsheet_id(self) -> str:
+        # 优先本页设置；若为空则尝试主界面表格 ID
+        local = self.spreadsheet_edit.text().strip()
+        if local:
+            return local
+        if callable(self.spreadsheet_supplier):
+            try:
+                return str(self.spreadsheet_supplier() or "").strip()
+            except Exception:
+                pass
+        return ""
 
     def build_ui(self):
         root = QVBoxLayout(self)
@@ -320,180 +334,218 @@ class DriveBatchUploadPage(QWidget):
         root.setSpacing(10)
 
         tip = QLabel(
-            "本地文件批量上传到 Google Drive：按分类目录建文件夹，写入「入库表」，记录「上传日志」。"
-            "逻辑对齐原 Web 多任务上传系统。首次使用若提示权限不足，请删除 token.json 后重新授权（需 Drive 写权限）。"
+            "左侧为上传设置（凭据与主界面共用）；右侧为任务列表、进度与回执链接。"
+            "视频类型来自表格「分类目录」第 D 列，不是写死选项。"
+            "若提示 Drive 权限不足，请删除 token.json 后重新授权。"
         )
         tip.setObjectName("subtitle")
         tip.setWordWrap(True)
         root.addWidget(tip)
 
-        settings = QFrame()
-        settings.setObjectName("compactPanel")
-        grid = QGridLayout(settings)
-        grid.setContentsMargins(14, 12, 14, 12)
-        grid.setHorizontalSpacing(10)
-        grid.setVerticalSpacing(8)
-        root.addWidget(settings)
+        body = QHBoxLayout()
+        body.setSpacing(12)
+        root.addLayout(body, 1)
 
-        self.credentials_edit = QLineEdit(self.credentials_path())
+        # ========== 左侧：设置 ==========
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        left_scroll.setMinimumWidth(360)
+        left_scroll.setMaximumWidth(440)
+        left_inner = QWidget()
+        left = QVBoxLayout(left_inner)
+        left.setContentsMargins(0, 0, 4, 0)
+        left.setSpacing(10)
+        left_scroll.setWidget(left_inner)
+        body.addWidget(left_scroll, 0)
+
+        settings = Card("设置")
+        left.addWidget(settings)
+        sg = QVBoxLayout()
+        sg.setSpacing(8)
+        settings.layout.addLayout(sg)
+
+        cred_tip = QLabel("凭据：与「表格 / 粘贴链接」页共用（主界面顶部凭据文件）")
+        cred_tip.setObjectName("fieldLabel")
+        cred_tip.setWordWrap(True)
+        sg.addWidget(cred_tip)
+        self.credentials_label = QLabel("")
+        self.credentials_label.setObjectName("subtitle")
+        self.credentials_label.setWordWrap(True)
+        sg.addWidget(self.credentials_label)
+
         self.spreadsheet_edit = QLineEdit()
-        self.spreadsheet_edit.setPlaceholderText("Google 表格 ID（含 分类目录 / 入库表 / 上传日志）")
+        self.spreadsheet_edit.setPlaceholderText("可留空则使用主界面表格 ID")
         self.parent_folder_edit = QLineEdit(DEFAULT_PARENT_FOLDER_ID)
-        self.parent_folder_edit.setPlaceholderText("Drive 父文件夹 ID")
         self.data_sheet_edit = QLineEdit(DATA_SHEET_NAME)
         self.category_sheet_edit = QLineEdit(CATEGORY_SHEET_NAME)
         self.log_sheet_edit = QLineEdit(LOG_SHEET_NAME)
         self.uploader_edit = QLineEdit()
-        self.uploader_edit.setPlaceholderText("上传者姓名")
+        self.uploader_edit.setPlaceholderText("上传者姓名 *")
 
-        self._add_field(grid, "凭据文件", self.credentials_edit, 0, 0, 1, 3)
-        cred_btn = QPushButton("选择")
-        cred_btn.setObjectName("secondaryButton")
-        cred_btn.clicked.connect(self.choose_credentials)
-        grid.addWidget(self._wrap_button(cred_btn), 0, 3)
-        self._add_field(grid, "表格 ID", self.spreadsheet_edit, 0, 4, 1, 2)
-        load_cat_btn = QPushButton("加载分类目录")
-        load_cat_btn.setObjectName("secondaryButton")
-        load_cat_btn.clicked.connect(self.load_categories)
-        grid.addWidget(self._wrap_button(load_cat_btn), 0, 6)
+        for label, widget in [
+            ("表格 ID", self.spreadsheet_edit),
+            ("Drive 父文件夹 ID", self.parent_folder_edit),
+            ("入库表名称", self.data_sheet_edit),
+            ("分类目录名称", self.category_sheet_edit),
+            ("上传日志名称", self.log_sheet_edit),
+            ("上传者 *", self.uploader_edit),
+        ]:
+            sg.addWidget(self._labeled(label, widget))
 
-        self._add_field(grid, "父文件夹 ID", self.parent_folder_edit, 1, 0, 1, 3)
-        self._add_field(grid, "入库表", self.data_sheet_edit, 1, 3)
-        self._add_field(grid, "分类目录", self.category_sheet_edit, 1, 4)
-        self._add_field(grid, "上传日志", self.log_sheet_edit, 1, 5)
-        self._add_field(grid, "上传者", self.uploader_edit, 1, 6)
+        load_row = QHBoxLayout()
+        self.load_cat_btn = QPushButton("加载分类目录")
+        self.load_cat_btn.setObjectName("secondaryButton")
+        self.sync_cred_btn = QPushButton("刷新共用凭据")
+        self.sync_cred_btn.setObjectName("ghostButton")
+        load_row.addWidget(self.load_cat_btn)
+        load_row.addWidget(self.sync_cred_btn)
+        sg.addLayout(load_row)
 
-        for col in range(7):
-            grid.setColumnStretch(col, 1)
-
-        # 模式 + 分类
+        # 模式
+        mode_card = Card("上传模式")
+        left.addWidget(mode_card)
         mode_row = QHBoxLayout()
-        mode_row.setSpacing(8)
-        root.addLayout(mode_row)
-        self.mode_standard_btn = QPushButton("视频/文件分类模式")
+        self.mode_standard_btn = QPushButton("分类上传")
         self.mode_standard_btn.setObjectName("primaryButton")
-        self.mode_image_btn = QPushButton("图片直传模式")
+        self.mode_image_btn = QPushButton("图片直传")
         self.mode_image_btn.setObjectName("secondaryButton")
         mode_row.addWidget(self.mode_standard_btn)
         mode_row.addWidget(self.mode_image_btn)
-        mode_row.addStretch()
+        mode_card.layout.addLayout(mode_row)
 
-        cat_panel = QFrame()
-        cat_panel.setObjectName("compactPanel")
-        cat_grid = QGridLayout(cat_panel)
-        cat_grid.setContentsMargins(14, 12, 14, 12)
-        cat_grid.setHorizontalSpacing(10)
-        root.addWidget(cat_panel)
-        self.cat_panel = cat_panel
+        self.cat_panel = QFrame()
+        self.cat_panel.setObjectName("fieldBox")
+        cat_box = QVBoxLayout(self.cat_panel)
+        cat_box.setContentsMargins(0, 0, 0, 0)
+        cat_box.setSpacing(8)
+        mode_card.layout.addWidget(self.cat_panel)
 
         self.cat1_combo = QComboBox()
         self.cat2_combo = QComboBox()
         self.cat3_combo = QComboBox()
         self.video_type_combo = QComboBox()
-        self.video_type_combo.addItems(VIDEO_TYPES)
-        self._add_field(cat_grid, "一级目录", self.cat1_combo, 0, 0)
-        self._add_field(cat_grid, "二级目录", self.cat2_combo, 0, 1)
-        self._add_field(cat_grid, "三级目录", self.cat3_combo, 0, 2)
-        self._add_field(cat_grid, "视频类型", self.video_type_combo, 0, 3)
+        self.video_type_combo.setEditable(True)
+        self.video_type_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.video_type_combo.setPlaceholderText("加载分类后显示（表 D 列）")
+        self.video_type_combo.setToolTip(
+            "视频类型来自「分类目录」工作表第 D 列的去重结果。\n"
+            "不是程序写死的选项。请先点「加载分类目录」。"
+        )
 
-        # 文件选择
-        file_row = QHBoxLayout()
-        file_row.setSpacing(8)
-        root.addLayout(file_row)
+        for label, widget in [
+            ("一级目录 *", self.cat1_combo),
+            ("二级目录", self.cat2_combo),
+            ("三级目录", self.cat3_combo),
+            ("视频类型（分类目录 D 列）", self.video_type_combo),
+        ]:
+            cat_box.addWidget(self._labeled(label, widget))
+
+        # 文件
+        file_card = Card("选择文件")
+        left.addWidget(file_card)
         self.pick_files_btn = QPushButton("选择文件")
         self.pick_files_btn.setObjectName("secondaryButton")
-        self.pick_folder_btn = QPushButton("选择文件夹内全部文件")
+        self.pick_folder_btn = QPushButton("选择文件夹内全部")
         self.pick_folder_btn.setObjectName("secondaryButton")
         self.clear_pending_btn = QPushButton("清空待添加")
         self.clear_pending_btn.setObjectName("ghostButton")
-        self.add_task_btn = QPushButton("加入上传清单")
+        self.add_task_btn = QPushButton("加入上传清单 →")
         self.add_task_btn.setObjectName("primaryButton")
-        file_row.addWidget(self.pick_files_btn)
-        file_row.addWidget(self.pick_folder_btn)
-        file_row.addWidget(self.clear_pending_btn)
-        file_row.addWidget(self.add_task_btn)
-        file_row.addStretch()
-
+        for b in (self.pick_files_btn, self.pick_folder_btn, self.clear_pending_btn, self.add_task_btn):
+            file_card.layout.addWidget(b)
         self.pending_label = QLabel("待添加文件：0")
         self.pending_label.setObjectName("status")
-        root.addWidget(self.pending_label)
+        file_card.layout.addWidget(self.pending_label)
 
-        options = QHBoxLayout()
-        options.setSpacing(14)
-        root.addLayout(options)
+        opt_card = Card("选项")
+        left.addWidget(opt_card)
         self.copyright_check = QCheckBox("我保证版权没有问题")
         self.copyright_check.setChecked(True)
-        self.skip_existing_check = QCheckBox("云端已有同名文件则跳过上传（仍写入入库表）")
+        self.skip_existing_check = QCheckBox("云端同名则跳过（仍写入入库表）")
         self.skip_existing_check.setChecked(True)
-        options.addWidget(self.copyright_check)
-        options.addWidget(self.skip_existing_check)
-        options.addStretch()
+        opt_card.layout.addWidget(self.copyright_check)
+        opt_card.layout.addWidget(self.skip_existing_check)
 
-        actions = QHBoxLayout()
-        actions.setSpacing(8)
-        root.addLayout(actions)
+        act_card = Card("操作")
+        left.addWidget(act_card)
         self.start_btn = QPushButton("开始批量上传")
         self.start_btn.setObjectName("primaryButton")
         self.stop_btn = QPushButton("停止")
         self.stop_btn.setObjectName("dangerButton")
         self.stop_btn.setEnabled(False)
-        self.clear_tasks_btn = QPushButton("清空清单")
+        self.clear_tasks_btn = QPushButton("清空右侧清单")
         self.clear_tasks_btn.setObjectName("ghostButton")
         self.open_folder_btn = QPushButton("打开父文件夹")
         self.open_folder_btn.setObjectName("secondaryButton")
-        actions.addWidget(self.start_btn)
-        actions.addWidget(self.stop_btn)
-        actions.addWidget(self.clear_tasks_btn)
-        actions.addWidget(self.open_folder_btn)
-        actions.addStretch()
+        for b in (self.start_btn, self.stop_btn, self.clear_tasks_btn, self.open_folder_btn):
+            act_card.layout.addWidget(b)
 
-        body = QHBoxLayout()
-        body.setSpacing(10)
-        root.addLayout(body, 5)
+        left.addStretch(1)
 
-        left = Card("上传清单")
-        right = Card("日志")
-        body.addWidget(left, 6)
-        body.addWidget(right, 4)
+        # ========== 右侧：任务 / 进度 / 回执 ==========
+        right = QVBoxLayout()
+        right.setSpacing(10)
+        body.addLayout(right, 1)
 
+        task_card = Card("任务列表")
+        right.addWidget(task_card, 3)
         self.table = QTableWidget(0, 7)
-        self.table.setHorizontalHeaderLabels(["#", "模式", "分类/路径", "文件", "状态", "云端链接", "文件夹"])
+        self.table.setHorizontalHeaderLabels(["#", "模式", "分类/路径", "文件", "状态", "文件链接", "文件夹"])
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         header.setStretchLastSection(True)
         self.table.setColumnWidth(0, 36)
-        self.table.setColumnWidth(1, 90)
-        self.table.setColumnWidth(2, 160)
-        self.table.setColumnWidth(3, 180)
-        self.table.setColumnWidth(4, 110)
-        self.table.setColumnWidth(5, 180)
+        self.table.setColumnWidth(1, 72)
+        self.table.setColumnWidth(2, 140)
+        self.table.setColumnWidth(3, 160)
+        self.table.setColumnWidth(4, 100)
+        self.table.setColumnWidth(5, 160)
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
-        left.layout.addWidget(self.table)
+        task_card.layout.addWidget(self.table)
 
+        prog_card = Card("上传进度")
+        right.addWidget(prog_card, 0)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_label = QLabel("等待开始")
+        self.progress_label.setObjectName("status")
+        prog_card.layout.addWidget(self.progress_label)
+        prog_card.layout.addWidget(self.progress_bar)
+
+        receipt_card = Card("回执链接（文件夹 / 文件）")
+        right.addWidget(receipt_card, 2)
+        self.receipt_box = QTextEdit()
+        self.receipt_box.setReadOnly(True)
+        self.receipt_box.setObjectName("pasteTextBox")
+        self.receipt_box.setPlaceholderText("上传成功后，这里会汇总任务文件夹链接与文件链接，可复制。")
+        receipt_card.layout.addWidget(self.receipt_box)
+        receipt_btns = QHBoxLayout()
+        self.copy_receipt_btn = QPushButton("复制全部回执")
+        self.copy_receipt_btn.setObjectName("secondaryButton")
+        self.clear_receipt_btn = QPushButton("清空回执")
+        self.clear_receipt_btn.setObjectName("ghostButton")
+        receipt_btns.addWidget(self.copy_receipt_btn)
+        receipt_btns.addWidget(self.clear_receipt_btn)
+        receipt_btns.addStretch()
+        receipt_card.layout.addLayout(receipt_btns)
+
+        log_card = Card("日志")
+        right.addWidget(log_card, 1)
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
-        right.layout.addWidget(self.log_box)
+        log_card.layout.addWidget(self.log_box)
 
-        self.status_row = QLabel("等待添加任务 · 上传路径：分类/日期/上传者")
+        self.status_row = QLabel("左侧配置设置 → 选文件加入清单 → 右侧查看进度与回执")
         self.status_row.setObjectName("status")
         root.addWidget(self.status_row)
 
-        self.log("上传板块已就绪。请填写表格 ID、父文件夹 ID，加载分类后选择文件。")
+        self.refresh_credentials_label()
+        self.log("上传页已就绪。凭据与主界面共用；视频类型将从分类目录 D 列加载。")
 
-    def _wrap_button(self, button: QPushButton) -> QFrame:
-        field = QFrame()
-        field.setObjectName("fieldBox")
-        box = QVBoxLayout(field)
-        box.setContentsMargins(0, 0, 0, 0)
-        box.setSpacing(4)
-        caption = QLabel(" ")
-        caption.setObjectName("fieldLabel")
-        box.addWidget(caption)
-        box.addWidget(button)
-        return field
-
-    def _add_field(self, grid, label, widget, row, col, row_span=1, col_span=1):
+    def _labeled(self, label: str, widget: QWidget) -> QFrame:
         field = QFrame()
         field.setObjectName("fieldBox")
         box = QVBoxLayout(field)
@@ -503,7 +555,6 @@ class DriveBatchUploadPage(QWidget):
         caption.setObjectName("fieldLabel")
         box.addWidget(caption)
         box.addWidget(widget)
-        grid.addWidget(field, row, col, row_span, col_span)
         return field
 
     def connect_signals(self):
@@ -511,6 +562,8 @@ class DriveBatchUploadPage(QWidget):
         self.mode_image_btn.clicked.connect(lambda: self.set_image_mode(True))
         self.cat1_combo.currentTextChanged.connect(self.on_cat1_changed)
         self.cat2_combo.currentTextChanged.connect(self.on_cat2_changed)
+        self.load_cat_btn.clicked.connect(self.load_categories)
+        self.sync_cred_btn.clicked.connect(self.refresh_credentials_label)
         self.pick_files_btn.clicked.connect(self.pick_files)
         self.pick_folder_btn.clicked.connect(self.pick_folder_files)
         self.clear_pending_btn.clicked.connect(self.clear_pending)
@@ -519,17 +572,29 @@ class DriveBatchUploadPage(QWidget):
         self.stop_btn.clicked.connect(self.stop_upload)
         self.clear_tasks_btn.clicked.connect(self.clear_tasks)
         self.open_folder_btn.clicked.connect(self.open_parent_folder)
+        self.copy_receipt_btn.clicked.connect(self.copy_receipts)
+        self.clear_receipt_btn.clicked.connect(self.receipt_box.clear)
+
+    def refresh_credentials_label(self):
+        path = self.credentials_path()
+        if path and os.path.exists(path):
+            self.credentials_label.setText(f"当前凭据：{path}")
+        else:
+            self.credentials_label.setText(f"当前凭据：{path or '（未设置，请到主界面「表格/粘贴链接」页选择）'}")
+        # 若本页表格 ID 为空，尝试同步主界面
+        if not self.spreadsheet_edit.text().strip() and callable(self.spreadsheet_supplier):
+            try:
+                sid = str(self.spreadsheet_supplier() or "").strip()
+                if sid:
+                    self.spreadsheet_edit.setText(sid)
+                    self.log(f"已同步主界面表格 ID：{sid}")
+            except Exception:
+                pass
+        self.log(f"共用凭据：{path}")
 
     def log(self, message: str):
         now = time.strftime("%H:%M:%S")
         self.log_box.append(f"[{now}] {message}")
-
-    def choose_credentials(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "选择凭据 JSON", self.credentials_edit.text(), "JSON (*.json);;所有文件 (*.*)"
-        )
-        if path:
-            self.credentials_edit.setText(path)
 
     def set_image_mode(self, enabled: bool):
         self.is_image_mode = enabled
@@ -537,21 +602,19 @@ class DriveBatchUploadPage(QWidget):
             self.mode_image_btn.setObjectName("primaryButton")
             self.mode_standard_btn.setObjectName("secondaryButton")
             self.cat_panel.setEnabled(False)
-            self.status_row.setText("图片直传模式 · 路径：图片素材/日期/上传者")
+            self.status_row.setText("图片直传 · 路径：图片素材/日期/上传者")
         else:
             self.mode_standard_btn.setObjectName("primaryButton")
             self.mode_image_btn.setObjectName("secondaryButton")
             self.cat_panel.setEnabled(True)
-            self.status_row.setText("分类模式 · 路径：一级/二级/三级/日期/上传者")
-        # 刷新按钮样式
+            self.status_row.setText("分类上传 · 路径：一级/二级/三级/日期/上传者")
         parent = self.window()
         if parent and hasattr(parent, "apply_style"):
             parent.apply_style()
         else:
-            self.mode_image_btn.style().unpolish(self.mode_image_btn)
-            self.mode_image_btn.style().polish(self.mode_image_btn)
-            self.mode_standard_btn.style().unpolish(self.mode_standard_btn)
-            self.mode_standard_btn.style().polish(self.mode_standard_btn)
+            for b in (self.mode_image_btn, self.mode_standard_btn):
+                b.style().unpolish(b)
+                b.style().polish(b)
 
     def has_running_worker(self) -> bool:
         return bool(self.worker and self.worker.isRunning())
@@ -560,11 +623,15 @@ class DriveBatchUploadPage(QWidget):
         if self.has_running_worker():
             QMessageBox.information(self, APP_SECTION, "上传任务进行中，请结束后再加载。")
             return
-        sid = self.spreadsheet_edit.text().strip()
+        self.refresh_credentials_label()
+        sid = self.spreadsheet_id()
         if not sid:
-            QMessageBox.warning(self, APP_SECTION, "请先填写表格 ID。")
+            QMessageBox.warning(self, APP_SECTION, "请填写表格 ID（或在主界面填写后点「刷新共用凭据」）。")
             return
-        cred = self.credentials_edit.text().strip() or self.credentials_path()
+        # 写回编辑框，避免空显示
+        if not self.spreadsheet_edit.text().strip():
+            self.spreadsheet_edit.setText(sid)
+        cred = self.credentials_path()
         self.log(f"正在加载分类目录：{self.category_sheet_edit.text().strip() or CATEGORY_SHEET_NAME}")
         self.start_btn.setEnabled(False)
         worker = CategoryLoadWorker(
@@ -582,13 +649,21 @@ class DriveBatchUploadPage(QWidget):
 
     def on_categories_loaded(self, rows: list):
         self.category_rows = list(rows or [])
-        cat1_values = []
-        seen = set()
+        # 一级
+        cat1_values, seen1 = [], set()
+        video_types, seen_t = [], set()
         for r in self.category_rows:
             c1 = r[0] if r else ""
-            if c1 and c1 not in seen:
-                seen.add(c1)
+            if c1 and c1 not in seen1:
+                seen1.add(c1)
                 cat1_values.append(c1)
+            # D 列 = 视频类型（第 4 列 index 3）
+            c4 = r[3] if len(r) > 3 else ""
+            c4 = str(c4 or "").strip()
+            if c4 and c4 not in seen_t:
+                seen_t.add(c4)
+                video_types.append(c4)
+
         self.cat1_combo.blockSignals(True)
         self.cat1_combo.clear()
         self.cat1_combo.addItem("")
@@ -596,13 +671,25 @@ class DriveBatchUploadPage(QWidget):
         self.cat1_combo.blockSignals(False)
         self.cat2_combo.clear()
         self.cat3_combo.clear()
-        self.log(f"一级目录 {len(cat1_values)} 项可选。")
-        self.status_row.setText(f"分类已加载：{len(self.category_rows)} 行")
+
+        # 视频类型：仅来自表格 D 列
+        current = self.video_type_combo.currentText().strip()
+        self.video_type_combo.blockSignals(True)
+        self.video_type_combo.clear()
+        self.video_type_combo.addItem("")
+        self.video_type_combo.addItems(video_types)
+        if current and current in video_types:
+            self.video_type_combo.setCurrentText(current)
+        self.video_type_combo.blockSignals(False)
+
+        self.log(f"一级目录 {len(cat1_values)} 项；视频类型（D 列）{len(video_types)} 项：{', '.join(video_types) or '（空）'}")
+        if not video_types:
+            self.log("提示：分类目录 D 列没有类型数据，视频类型可手动输入，或在表格 D 列补充后重新加载。")
+        self.status_row.setText(f"分类已加载：{len(self.category_rows)} 行 · 类型 {len(video_types)} 种")
 
     def on_cat1_changed(self, text: str):
         text = (text or "").strip()
-        cat2_values = []
-        seen = set()
+        cat2_values, seen = [], set()
         for r in self.category_rows:
             if (r[0] if r else "") != text:
                 continue
@@ -616,12 +703,12 @@ class DriveBatchUploadPage(QWidget):
         self.cat2_combo.addItems(cat2_values)
         self.cat2_combo.blockSignals(False)
         self.cat3_combo.clear()
+        self._refresh_video_types_for_selection()
 
     def on_cat2_changed(self, text: str):
         c1 = self.cat1_combo.currentText().strip()
         c2 = (text or "").strip()
-        cat3_values = []
-        seen = set()
+        cat3_values, seen = [], set()
         for r in self.category_rows:
             if (r[0] if r else "") != c1:
                 continue
@@ -634,6 +721,37 @@ class DriveBatchUploadPage(QWidget):
         self.cat3_combo.clear()
         self.cat3_combo.addItem("")
         self.cat3_combo.addItems(cat3_values)
+        self._refresh_video_types_for_selection()
+
+    def _refresh_video_types_for_selection(self):
+        """按当前一/二级筛选 D 列类型（仍只来自表格）。"""
+        c1 = self.cat1_combo.currentText().strip()
+        c2 = self.cat2_combo.currentText().strip()
+        types, seen = [], set()
+        for r in self.category_rows:
+            if c1 and (r[0] if r else "") != c1:
+                continue
+            if c2 and (r[1] if len(r) > 1 else "") != c2:
+                continue
+            c4 = str(r[3] if len(r) > 3 else "").strip()
+            if c4 and c4 not in seen:
+                seen.add(c4)
+                types.append(c4)
+        # 若筛选后为空，回退全部 D 列
+        if not types:
+            for r in self.category_rows:
+                c4 = str(r[3] if len(r) > 3 else "").strip()
+                if c4 and c4 not in seen:
+                    seen.add(c4)
+                    types.append(c4)
+        current = self.video_type_combo.currentText().strip()
+        self.video_type_combo.blockSignals(True)
+        self.video_type_combo.clear()
+        self.video_type_combo.addItem("")
+        self.video_type_combo.addItems(types)
+        if current and (current in types or self.video_type_combo.isEditable()):
+            self.video_type_combo.setCurrentText(current)
+        self.video_type_combo.blockSignals(False)
 
     def pick_files(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "选择要上传的文件", "", "所有文件 (*.*)")
@@ -671,18 +789,19 @@ class DriveBatchUploadPage(QWidget):
             return
         uploader = self.uploader_edit.text().strip()
         if not uploader:
-            QMessageBox.warning(self, APP_SECTION, "请填写上传者。")
+            QMessageBox.warning(self, APP_SECTION, "请在左侧设置中填写上传者。")
             return
         if not self.is_image_mode:
             cat1 = self.cat1_combo.currentText().strip()
             if not cat1:
                 QMessageBox.warning(self, APP_SECTION, "分类模式请选择一级目录。")
                 return
-        else:
-            cat1 = cat2 = cat3 = ""
-        if not self.is_image_mode:
             cat2 = self.cat2_combo.currentText().strip()
             cat3 = self.cat3_combo.currentText().strip()
+            vtype = self.video_type_combo.currentText().strip()
+        else:
+            cat1 = cat2 = cat3 = ""
+            vtype = ""
 
         self.task_seq += 1
         files = [
@@ -699,7 +818,7 @@ class DriveBatchUploadPage(QWidget):
             cat1=cat1 if not self.is_image_mode else "图片素材",
             cat2=cat2 if not self.is_image_mode else "",
             cat3=cat3 if not self.is_image_mode else "",
-            video_type="" if self.is_image_mode else self.video_type_combo.currentText(),
+            video_type=vtype,
             uploader=uploader,
             files=files,
         )
@@ -714,6 +833,8 @@ class DriveBatchUploadPage(QWidget):
             return
         self.tasks = []
         self.rebuild_table()
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("等待开始")
         self.log("已清空上传清单。")
 
     def rebuild_table(self):
@@ -723,20 +844,16 @@ class DriveBatchUploadPage(QWidget):
             if task.is_image_mode:
                 path_label = f"图片素材 / {task.uploader}"
             else:
-                path_label = " / ".join([x for x in [task.cat1, task.cat2, task.cat3, task.uploader] if x])
+                parts = [task.cat1, task.cat2, task.cat3]
+                if task.video_type:
+                    parts.append(f"[{task.video_type}]")
+                parts.append(task.uploader)
+                path_label = " / ".join([x for x in parts if x])
             for f in task.files:
                 rows.append((task, f, mode, path_label))
         self.table.setRowCount(len(rows))
         for i, (task, f, mode, path_label) in enumerate(rows):
-            values = [
-                task.index,
-                mode,
-                path_label,
-                f.name,
-                f.status,
-                f.file_url,
-                task.folder_url,
-            ]
+            values = [task.index, mode, path_label, f.name, f.status, f.file_url, task.folder_url]
             for col, val in enumerate(values):
                 cell = QTableWidgetItem("" if val is None else str(val))
                 if col == 4:
@@ -748,7 +865,39 @@ class DriveBatchUploadPage(QWidget):
                     elif "跳过" in st:
                         cell.setForeground(QColor("#ca8a04"))
                 self.table.setItem(i, col, cell)
-        self.status_row.setText(f"清单：{len(self.tasks)} 个任务，{sum(len(t.files) for t in self.tasks)} 个文件")
+        self.status_row.setText(
+            f"清单：{len(self.tasks)} 个任务，{sum(len(t.files) for t in self.tasks)} 个文件"
+        )
+        self.refresh_receipt_box()
+
+    def refresh_receipt_box(self):
+        lines = []
+        for task in self.tasks:
+            mode = "图片直传" if task.is_image_mode else "分类上传"
+            title = " / ".join(
+                [x for x in [task.cat1, task.cat2, task.cat3, task.video_type, task.uploader] if x]
+            )
+            lines.append(f"【任务#{task.index}】{mode} · {title}")
+            if task.folder_url:
+                lines.append(f"  文件夹：{task.folder_url}")
+            for f in task.files:
+                if f.file_url:
+                    lines.append(f"  · {f.name} → {f.file_url}")
+            lines.append("")
+        text = "\n".join(lines).strip()
+        # 不覆盖用户手动编辑：仅在有内容时更新
+        if text:
+            self.receipt_box.setPlainText(text)
+
+    def copy_receipts(self):
+        text = self.receipt_box.toPlainText().strip()
+        if not text:
+            QMessageBox.information(self, APP_SECTION, "暂无回执内容。")
+            return
+        from PySide6.QtWidgets import QApplication
+        QApplication.clipboard().setText(text)
+        self.log("回执已复制到剪贴板。")
+        QMessageBox.information(self, APP_SECTION, "回执链接已复制到剪贴板。")
 
     def start_upload(self):
         if self.has_running_worker():
@@ -762,17 +911,22 @@ class DriveBatchUploadPage(QWidget):
                 self, APP_SECTION, "未勾选版权声明，是否仍继续上传？"
             ) != QMessageBox.StandardButton.Yes:
                 return
-        sid = self.spreadsheet_edit.text().strip()
+        self.refresh_credentials_label()
+        sid = self.spreadsheet_id()
         parent = self.parent_folder_edit.text().strip()
         if not sid or not parent:
             QMessageBox.warning(self, APP_SECTION, "请填写表格 ID 和父文件夹 ID。")
             return
+        if not self.spreadsheet_edit.text().strip():
+            self.spreadsheet_edit.setText(sid)
 
         self.set_running(True)
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("正在上传…")
         self.status_row.setText("正在上传…")
         self.log("开始批量上传到 Google Drive…")
         worker = UploadWorker(
-            credentials_path=self.credentials_edit.text().strip() or self.credentials_path(),
+            credentials_path=self.credentials_path(),
             token_path=self.token_path,
             spreadsheet_id=sid,
             parent_folder_id=parent,
@@ -818,10 +972,15 @@ class DriveBatchUploadPage(QWidget):
         self.rebuild_table()
 
     def on_progress(self, done: int, total: int):
+        pct = int(done * 100 / total) if total else 0
+        self.progress_bar.setValue(pct)
+        self.progress_label.setText(f"上传进度 {done}/{total}（{pct}%）")
         self.status_row.setText(f"上传进度 {done}/{total}")
 
     def on_upload_done(self):
         self.status_row.setText("上传任务结束")
+        self.progress_label.setText("上传完成")
+        self.refresh_receipt_box()
         self.log("批量上传流程结束。")
 
     def on_worker_finished(self):
@@ -832,6 +991,7 @@ class DriveBatchUploadPage(QWidget):
     def set_running(self, running: bool):
         self.start_btn.setEnabled(not running)
         self.add_task_btn.setEnabled(not running)
+        self.load_cat_btn.setEnabled(not running)
         self.stop_btn.setEnabled(running)
 
     def open_parent_folder(self):
@@ -844,7 +1004,6 @@ class DriveBatchUploadPage(QWidget):
     def show_error(self, message: str):
         self.log(message)
         self.status_row.setText("出现错误")
-        # 权限提示
         if "insufficient" in message.lower() or "scope" in message.lower() or "权限" in message:
             message += (
                 "\n\n若刚升级支持上传功能，请关闭程序后删除 token.json，"

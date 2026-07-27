@@ -556,12 +556,6 @@ class MainWindow(QMainWindow):
         self.video_page = VideoBatchPage()
         self.main_tabs.addTab(self.video_page, "YouTube / FB 视频")
 
-        self.upload_page = DriveBatchUploadPage(
-            credentials_supplier=lambda: self.credentials_edit.text().strip(),
-            token_path=self.token_file_path,
-        )
-        self.main_tabs.addTab(self.upload_page, "批量上传云端")
-
         compact_panel = QFrame()
         compact_panel.setObjectName("compactPanel")
         panel_layout = QGridLayout(compact_panel)
@@ -718,6 +712,14 @@ class MainWindow(QMainWindow):
         self.save_config_btn.clicked.connect(self.save_current_config)
         self.delete_config_btn.clicked.connect(self.delete_current_config)
         self.run_all_btn.clicked.connect(self.start_all_configs)
+
+        # 上传页依赖主界面凭据/表格控件，须在其创建之后挂载
+        self.upload_page = DriveBatchUploadPage(
+            credentials_supplier=lambda: self.credentials_edit.text().strip(),
+            spreadsheet_supplier=lambda: self.spreadsheet_edit.text().strip(),
+            token_path=self.token_file_path,
+        )
+        self.main_tabs.addTab(self.upload_page, "批量上传云端")
 
     def add_file_row(self, layout, label, edit, handler, button_text="选择"):
         row = QHBoxLayout()
