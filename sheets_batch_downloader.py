@@ -192,6 +192,10 @@ def extract_drive_file_info(url: str):
     query = parse_qs(parsed.query)
     resource_key = query.get("resourcekey", [""])[0]
 
+    # 文件夹链接交给 extract_drive_folder_id，避免把 folder id 当文件
+    if extract_drive_folder_id(text):
+        return "", resource_key
+
     match = re.search(r"/file/d/([a-zA-Z0-9_-]+)", text)
     if match:
         return match.group(1), resource_key
@@ -201,6 +205,52 @@ def extract_drive_file_info(url: str):
         return file_id, resource_key
 
     return "", resource_key
+
+
+def extract_drive_folder_id(url: str) -> str:
+    """从 Google Drive 文件夹链接解析 folder id。"""
+    text = str(url or "").strip()
+    if not text:
+        return ""
+    match = re.search(r"/folders/([a-zA-Z0-9_-]+)", text, re.I)
+    if match:
+        return match.group(1)
+    parsed = urlparse(text)
+    query = parse_qs(parsed.query)
+    if re.search(r"folderview|drive\.google\.com", text, re.I):
+        # folderview?id=... 或 open?id=... 且路径像文件夹
+        fid = (query.get("id") or [""])[0]
+        if fid and re.search(r"folder", text, re.I):
+            return fid
+        # open?id= 可能是文件也可能是文件夹，仅 folderview 可靠
+        if "folderview" in text.lower() and fid:
+            return fid
+    return ""
+
+
+def is_drive_folder_url(url: str) -> bool:
+    return bool(extract_drive_folder_id(url))
+
+
+def drive_match_keys(url: str) -> set:
+    """用于粘贴链接与表格链接列匹配的归一化键（文件/文件夹 ID + 去参 URL）。"""
+    text = str(url or "").strip()
+    keys = set()
+    if not text:
+        return keys
+    base = text.split("#")[0].split("?")[0].rstrip("/").lower()
+    if base:
+        keys.add(base)
+    keys.add(text.lower())
+    folder_id = extract_drive_folder_id(text)
+    if folder_id:
+        keys.add(f"folder:{folder_id}")
+        keys.add(folder_id.lower())
+    file_id, _ = extract_drive_file_info(text)
+    if file_id:
+        keys.add(f"file:{file_id}")
+        keys.add(file_id.lower())
+    return {k for k in keys if k}
 
 
 def extension_from_name(name: str) -> str:
@@ -426,6 +476,36 @@ class GoogleClient:
             infos.append(SheetInfo(props.get("title", ""), int(grid.get("rowCount", 0) or 0)))
         return infos
 
+    def sheet_end_row(self, spreadsheet_id: str, sheet_name: str, default: int = 5000) -> int:
+        for info in self.list_sheets(spreadsheet_id):
+            if info.title == sheet_name and info.row_count:
+                return max(int(info.row_count), 2)
+        return default
+
+    def read_name_row_map(
+        self,
+        spreadsheet_id: str,
+        sheet_name: str,
+        name_col: str = "A",
+        start_row: int = 2,
+    ) -> dict:
+        """只读名称列 → {小写名字: 行号}，供粘贴下载回填定位，不遍历链接列。"""
+        end_row = self.sheet_end_row(spreadsheet_id, sheet_name)
+        col = number_to_column(column_to_number(name_col or "A"))
+        range_name = f"{quote_sheet_name(sheet_name)}!{col}{start_row}:{col}{end_row}"
+        result = self.sheets.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=range_name,
+        ).execute()
+        values = result.get("values") or []
+        mapping = {}
+        for offset, row in enumerate(values):
+            text = str(row[0] if row else "").strip()
+            if not text:
+                continue
+            mapping[text.lower()] = start_row + offset
+        return mapping
+
     def read_items(
         self,
         spreadsheet_id: str,
@@ -478,16 +558,118 @@ class GoogleClient:
         ).execute()
         return metadata.get("name") or "file"
 
-    def download_drive_file(self, file_id: str, target_path: str, stop_event: threading.Event):
-        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    def get_drive_folder_name(self, folder_id: str) -> str:
+        metadata = self.drive.files().get(
+            fileId=folder_id,
+            fields="name,mimeType",
+            supportsAllDrives=True,
+        ).execute()
+        return metadata.get("name") or "folder"
+
+    def list_folder_files(self, folder_id: str, recursive: bool = True) -> list:
+        """列出文件夹内可下载文件（跳过 Google 在线文档），返回 [{id,name,mimeType,relative_path}, ...]。"""
+        folder_mime = "application/vnd.google-apps.folder"
+        shortcut_mime = "application/vnd.google-apps.shortcut"
+        out = []
+
+        def walk(fid: str, rel_prefix: str = ""):
+            page_token = None
+            while True:
+                result = self.drive.files().list(
+                    q=f"'{fid}' in parents and trashed=false",
+                    spaces="drive",
+                    fields="nextPageToken, files(id,name,mimeType,shortcutDetails)",
+                    pageSize=1000,
+                    pageToken=page_token or "",
+                    supportsAllDrives=True,
+                    includeItemsFromAllDrives=True,
+                    orderBy="folder,name",
+                ).execute()
+                for f in result.get("files") or []:
+                    mime = f.get("mimeType") or ""
+                    name = f.get("name") or "file"
+                    safe_name = sanitize_path_part(name)
+                    if mime == folder_mime:
+                        if recursive:
+                            walk(f["id"], f"{rel_prefix}{safe_name}/")
+                        continue
+                    if mime == shortcut_mime:
+                        details = f.get("shortcutDetails") or {}
+                        target_id = details.get("targetId") or ""
+                        target_mime = details.get("targetMimeType") or ""
+                        if not target_id or target_mime == folder_mime:
+                            continue
+                        if str(target_mime).startswith("application/vnd.google-apps."):
+                            continue
+                        out.append({
+                            "id": target_id,
+                            "name": name,
+                            "mimeType": target_mime,
+                            "relative_path": f"{rel_prefix}{safe_name}",
+                        })
+                        continue
+                    # 在线文档/表格等无法用 get_media 直接下，跳过
+                    if str(mime).startswith("application/vnd.google-apps."):
+                        continue
+                    out.append({
+                        "id": f["id"],
+                        "name": name,
+                        "mimeType": mime,
+                        "relative_path": f"{rel_prefix}{safe_name}",
+                    })
+                page_token = result.get("nextPageToken")
+                if not page_token:
+                    break
+
+        walk(str(folder_id or "").strip())
+        return out
+
+    def download_drive_file(
+        self,
+        file_id: str,
+        target_path: str,
+        stop_event: threading.Event,
+        pause_event: threading.Event | None = None,
+    ):
+        """下载到 target_path；先写 .part，成功后再替换，避免半成品被当成已完成。
+        pause_event 置位时在分块之间等待（暂停），stop_event 中止。
+        """
+        parent = os.path.dirname(target_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        part_path = target_path + ".part"
+        # 半成品重下：Drive get_media 不便字节续传，删掉 part 重新拉完整文件
+        if os.path.exists(part_path):
+            try:
+                os.remove(part_path)
+            except Exception:
+                pass
         request = self.drive.files().get_media(fileId=file_id, supportsAllDrives=True)
-        with open(target_path, "wb") as f:
-            downloader = self.MediaIoBaseDownload(f, request)
-            done = False
-            while not done:
-                if stop_event.is_set():
-                    raise RuntimeError("任务已停止")
-                _, done = downloader.next_chunk()
+        try:
+            with open(part_path, "wb") as f:
+                downloader = self.MediaIoBaseDownload(f, request, chunksize=1024 * 1024)
+                done = False
+                while not done:
+                    if stop_event is not None and stop_event.is_set():
+                        raise RuntimeError("任务已停止")
+                    if pause_event is not None:
+                        while pause_event.is_set() and not (stop_event and stop_event.is_set()):
+                            time.sleep(0.2)
+                        if stop_event is not None and stop_event.is_set():
+                            raise RuntimeError("任务已停止")
+                    _, done = downloader.next_chunk()
+            # 原子替换
+            if os.path.exists(target_path):
+                try:
+                    os.remove(target_path)
+                except Exception:
+                    pass
+            os.replace(part_path, target_path)
+        except Exception:
+            # 保留 .part 便于识别未完成；完整失败时清理
+            if stop_event is not None and stop_event.is_set():
+                pass
+            raise
         return target_path
 
     def write_success_name(self, spreadsheet_id: str, sheet_name: str, row_number: int, column: str, value: str):
@@ -500,6 +682,71 @@ class GoogleClient:
             valueInputOption="RAW",
             body={"values": [[value]]},
         ).execute()
+
+    def write_row_fields(
+        self,
+        spreadsheet_id: str,
+        sheet_name: str,
+        row_number: int,
+        fields: dict,
+    ):
+        """一次写入同行多列：fields = { 'E': '正在下载', 'F': 12, ... }"""
+        data = []
+        for col, value in (fields or {}).items():
+            col = str(col or "").strip()
+            if not col:
+                continue
+            data.append({
+                "range": f"{quote_sheet_name(sheet_name)}!{number_to_column(column_to_number(col))}{int(row_number)}",
+                "values": [[value]],
+            })
+        if not data:
+            return
+        self.sheets.spreadsheets().values().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"valueInputOption": "RAW", "data": data},
+        ).execute()
+
+    def read_name_link_index(
+        self,
+        spreadsheet_id: str,
+        sheet_name: str,
+        name_col: str = "A",
+        link_col: str = "C",
+        start_row: int = 2,
+    ) -> list:
+        """读取名称列 + 链接列，返回 [{row_number, name, url, keys}, ...]。"""
+        end_row = self.sheet_end_row(spreadsheet_id, sheet_name)
+        name_col_num = column_to_number(name_col or "A")
+        link_col_num = column_to_number(link_col or "C")
+        max_col = max(name_col_num, link_col_num)
+        range_name = f"{quote_sheet_name(sheet_name)}!A{start_row}:{number_to_column(max_col)}{end_row}"
+
+        result = self.sheets.spreadsheets().get(
+            spreadsheetId=spreadsheet_id,
+            ranges=[range_name],
+            includeGridData=True,
+        ).execute()
+        grid_data = (((result.get("sheets") or [{}])[0].get("data") or [{}])[0])
+        rows = grid_data.get("rowData") or []
+        out = []
+        for offset, row in enumerate(rows):
+            row_number = start_row + offset
+            values = row.get("values") or []
+            name_cell = values[name_col_num - 1] if name_col_num - 1 < len(values) else {}
+            link_cell = values[link_col_num - 1] if link_col_num - 1 < len(values) else {}
+            name = get_cell_text(name_cell).strip()
+            source = get_cell_text(link_cell).strip()
+            url = (get_cell_link(link_cell) or find_url_in_text(source) or "").strip()
+            if not url and not name:
+                continue
+            out.append({
+                "row_number": row_number,
+                "name": name,
+                "url": url,
+                "keys": sorted(drive_match_keys(url)),
+            })
+        return out
 
     # ---------- Drive 上传 / 入库表 ----------
 

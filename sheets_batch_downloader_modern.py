@@ -42,14 +42,17 @@ from sheets_batch_downloader import (
     PublicDownloader,
     default_token_path,
     extract_drive_file_info,
+    extract_drive_folder_id,
     extension_from_name,
     find_url_in_text,
+    is_drive_folder_url,
     parse_title,
     sanitize_path_part,
     unique_path,
 )
 from video_batch_downloader import VideoBatchPage
 from drive_batch_uploader import DriveBatchUploadPage
+from paste_link_download_page import PasteLinkDownloadPage
 from version import APP_NAME, APP_VERSION, RELEASES_PAGE
 from updater import (
     check_for_update,
@@ -100,6 +103,59 @@ def build_target_path(output_dir, item, source_name):
     return os.path.join(output_dir, item.group_name, safe_source_name)
 
 
+FOLDER_DONE_MARKER = ".diy_folder_done.json"
+
+
+def folder_local_dir(output_dir: str, item) -> str:
+    """云端文件夹下载到本地分类目录（A 列/命名规则生成的 group_name）。"""
+    return os.path.join(output_dir, sanitize_path_part(item.group_name or f"row_{item.row_number}"))
+
+
+def folder_marker_path(local_dir: str) -> str:
+    return os.path.join(local_dir, FOLDER_DONE_MARKER)
+
+
+def read_folder_marker(local_dir: str) -> dict:
+    path = folder_marker_path(local_dir)
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def write_folder_marker(local_dir: str, folder_id: str, url: str, file_count: int, relative_paths: list):
+    os.makedirs(local_dir, exist_ok=True)
+    payload = {
+        "folder_id": folder_id,
+        "url": url,
+        "file_count": int(file_count),
+        "files": list(relative_paths),
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    with open(folder_marker_path(local_dir), "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def folder_download_complete(local_dir: str, folder_id: str, remote_files: list) -> bool:
+    """同一云端文件夹链接是否已完整下载到本地分类目录。"""
+    marker = read_folder_marker(local_dir)
+    if not marker or str(marker.get("folder_id") or "") != str(folder_id or ""):
+        return False
+    rels = [str(f.get("relative_path") or f.get("name") or "") for f in remote_files]
+    if not rels:
+        return int(marker.get("file_count") or 0) == 0
+    for rel in rels:
+        if not rel:
+            continue
+        if not os.path.isfile(os.path.join(local_dir, rel)):
+            return False
+    return True
+
+
 class LinkHTMLParser(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -142,7 +198,12 @@ def source_name_from_url(url):
 
 
 def parse_pasted_links(plain_text, html_text, group_mode, keyword=""):
-    records = []
+    """解析粘贴内容。支持：
+    - 纯链接 / 名字+链接 / 从表格复制的超链接
+    - 显式行号：`12 张三 https://...` 或 `12\\thttps://...`（便于回填到指定行）
+    不读取表格链接列；回填时用行号或名称列匹配。
+    """
+    records = []  # (title, url, sheet_row)
 
     if html_text:
         parser = LinkHTMLParser()
@@ -151,7 +212,7 @@ def parse_pasted_links(plain_text, html_text, group_mode, keyword=""):
             for text, href in parser.links:
                 url = clean_pasted_url(href)
                 if url.startswith("http"):
-                    records.append((text.strip(), url))
+                    records.append((text.strip(), url, 0))
         except Exception:
             pass
 
@@ -159,16 +220,22 @@ def parse_pasted_links(plain_text, html_text, group_mode, keyword=""):
         line = raw_line.strip()
         if not line:
             continue
+        sheet_row = 0
+        # 行号 + 内容
+        m = re.match(r"^(\d{1,7})[\s\t|，,]+(.+)$", line)
+        if m:
+            sheet_row = int(m.group(1))
+            line = m.group(2).strip()
         url = clean_pasted_url(line)
         if not url.startswith("http"):
             continue
         title = line.replace(url, "").strip(" \t-|：:")
-        records.append((title, url))
+        records.append((title, url, sheet_row if sheet_row >= 2 else 0))
 
     seen = set()
     items = []
     keyword_text = str(keyword or "").strip().lower()
-    for index, (title, url) in enumerate(records, start=1):
+    for index, (title, url, sheet_row) in enumerate(records, start=1):
         if url in seen:
             continue
         seen.add(url)
@@ -176,8 +243,81 @@ def parse_pasted_links(plain_text, html_text, group_mode, keyword=""):
         display_name = source_name or f"粘贴链接-{index}"
         if keyword_text and keyword_text not in display_name.lower() and keyword_text not in url.lower():
             continue
-        group_name, file_number = parse_title(display_name, index, group_mode)
-        items.append(DownloadItem(index, display_name, url, source_name, "", group_name, file_number))
+        group_name, file_number = parse_title(display_name, sheet_row or index, group_mode)
+        # match_name 用于名字回填；row_number=0 表示稍后按名称列匹配表格行
+        items.append(
+            DownloadItem(
+                sheet_row or 0,
+                display_name,
+                url,
+                source_name,
+                title or display_name,
+                group_name,
+                file_number,
+            )
+        )
+    return items
+
+
+def resolve_paste_items_to_sheet_rows(client, items, settings, log_emit=None):
+    """粘贴任务绑定表格行号：优先已有行号，否则只读名称列匹配（不扫链接列）。"""
+    sid = str((settings or {}).get("spreadsheet_id") or "").strip()
+    sheet = str((settings or {}).get("sheet_name") or "").strip()
+    name_col = str((settings or {}).get("name_col") or "A").strip() or "A"
+    if not sid or not sheet or not items:
+        return items
+
+    try:
+        name_map = client.read_name_row_map(sid, sheet, name_col)
+    except Exception as exc:
+        if log_emit:
+            log_emit(f"读取名称列失败，无法自动匹配回填行：{exc}")
+        return items
+
+    if log_emit:
+        log_emit(f"已读名称列 {name_col}：{len(name_map)} 个名字，用于粘贴回填定位（未遍历链接列）。")
+
+    resolved = 0
+    for item in items:
+        if int(item.row_number or 0) >= 2:
+            resolved += 1
+            continue
+        candidates = [
+            str(item.match_name or "").strip(),
+            str(item.title or "").strip(),
+            str(item.source_name or "").strip(),
+            str(item.group_name or "").strip(),
+        ]
+        hit = 0
+        for key in candidates:
+            if not key:
+                continue
+            row = name_map.get(key.lower())
+            if row:
+                hit = row
+                break
+        if not hit:
+            # 宽松：名字互相包含
+            for key in candidates:
+                if not key or len(key) < 2:
+                    continue
+                kl = key.lower()
+                for name, row in name_map.items():
+                    if kl in name or name in kl:
+                        hit = row
+                        break
+                if hit:
+                    break
+        if hit:
+            item.row_number = hit
+            if not item.match_name:
+                item.match_name = item.title or item.source_name
+            resolved += 1
+        elif log_emit:
+            log_emit(f"未匹配到表格行，下载后不会回填：{item.title or item.url[:60]}")
+
+    if log_emit:
+        log_emit(f"粘贴任务中 {resolved}/{len(items)} 条已绑定表格行，可回填名字与数量。")
     return items
 
 
@@ -224,16 +364,24 @@ class PreviewWorker(WorkerBase):
         try:
             client = self.make_client()
             settings = dict(self.settings)
-            scan_all = settings.pop("scan_all", False)
-            if scan_all:
-                for info in client.list_sheets(settings["spreadsheet_id"]):
-                    if info.title == settings["sheet_name"] and info.row_count:
-                        settings["end_row"] = info.row_count
-                        self.log.emit(f"已刷新结束行：{info.row_count}")
-                        break
+            # 始终整表扫描：从第 2 行到工作表末尾
+            settings["start_row"] = 2
+            settings.pop("scan_all", None)
+            for info in client.list_sheets(settings["spreadsheet_id"]):
+                if info.title == settings["sheet_name"] and info.row_count:
+                    settings["end_row"] = max(int(info.row_count), 2)
+                    self.log.emit(f"整列扫描至第 {settings['end_row']} 行")
+                    break
             items = client.read_items(**settings)
             rows = []
+            folder_links = 0
             for item in items[:500]:
+                is_folder = bool(item.url and is_drive_folder_url(item.url))
+                if is_folder:
+                    folder_links += 1
+                link_state = "无链接"
+                if item.url.startswith("http"):
+                    link_state = "文件夹" if is_folder else "有链接"
                 rows.append({
                     "row_number": item.row_number,
                     "folder": item.group_name,
@@ -242,10 +390,15 @@ class PreviewWorker(WorkerBase):
                     "match_name": item.match_name,
                     "url": item.url,
                     "has_link": item.url.startswith("http"),
+                    "is_folder": is_folder,
+                    "link_state": link_state,
                 })
             self.preview_ready.emit(rows)
             link_count = sum(1 for item in items if item.url.startswith("http"))
-            self.log.emit(f"预览完成：匹配 {len(items)} 行，其中 {link_count} 行有链接。")
+            self.log.emit(
+                f"预览完成：匹配 {len(items)} 行，其中 {link_count} 行有链接"
+                f"（含 {folder_links} 个云端文件夹，下载时解析文件数）。"
+            )
         except Exception as exc:
             self.failed.emit(f"预览失败：{exc}")
 
@@ -254,13 +407,25 @@ class DownloadWorker(WorkerBase):
     progress = Signal(dict)
     done = Signal()
 
-    def __init__(self, credentials_path, token_path, settings, output_dir, skip_existing, backfill_enabled, backfill_col, pasted_items=None):
+    def __init__(
+        self,
+        credentials_path,
+        token_path,
+        settings,
+        output_dir,
+        skip_existing,
+        backfill_enabled,
+        backfill_col,
+        count_backfill_col="",
+        pasted_items=None,
+    ):
         super().__init__(credentials_path, token_path)
         self.settings = settings
         self.output_dir = output_dir
         self.skip_existing = skip_existing
         self.backfill_enabled = backfill_enabled
         self.backfill_col = backfill_col
+        self.count_backfill_col = str(count_backfill_col or "").strip()
         self.pasted_items = pasted_items
         self.stop_event = threading.Event()
         self.backfill_disabled = False
@@ -268,8 +433,33 @@ class DownloadWorker(WorkerBase):
     def stop(self):
         self.stop_event.set()
 
+    def _handle_backfill_error(self, item, exc, kind="回填"):
+        message = str(exc)
+        if "ACCESS_TOKEN_SCOPE_INSUFFICIENT" in message or "insufficient authentication scopes" in message:
+            self.backfill_disabled = True
+            self.log.emit(
+                "回填失败：当前授权缺少表格写入权限。请关闭程序，删除 token.json 后重新授权；"
+                "本次将继续下载但不再回填。"
+            )
+        else:
+            self.log.emit(f"第 {item.row_number} 行{kind}失败：{exc}")
+
+    def can_backfill_row(self, item) -> bool:
+        """粘贴/表格模式通用：有表配置且绑定了有效行号才回填。"""
+        if not self.backfill_enabled or self.backfill_disabled:
+            return False
+        if not self.settings:
+            return False
+        if not str(self.settings.get("spreadsheet_id") or "").strip():
+            return False
+        if not str(self.settings.get("sheet_name") or "").strip():
+            return False
+        if int(getattr(item, "row_number", 0) or 0) < 2:
+            return False
+        return True
+
     def try_backfill(self, client, item, source_name):
-        if self.pasted_items is not None or not self.backfill_enabled or self.backfill_disabled:
+        if not self.can_backfill_row(item) or not self.backfill_col or client is None:
             return
         value = item.match_name or source_name
         try:
@@ -281,12 +471,73 @@ class DownloadWorker(WorkerBase):
                 value,
             )
         except Exception as exc:
-            message = str(exc)
-            if "ACCESS_TOKEN_SCOPE_INSUFFICIENT" in message or "insufficient authentication scopes" in message:
-                self.backfill_disabled = True
-                self.log.emit("回填失败：当前授权缺少表格写入权限。请关闭程序，删除 token.json 后重新授权；本次将继续下载但不再回填。")
-            else:
-                self.log.emit(f"第 {item.row_number} 行回填失败：{exc}")
+            self._handle_backfill_error(item, exc, "名字回填")
+
+    def try_backfill_count(self, client, item, count):
+        """下载完成后把文件夹文件数量回填到自定义列。"""
+        if not self.can_backfill_row(item) or not self.count_backfill_col or client is None:
+            return
+        try:
+            client.write_success_name(
+                self.settings["spreadsheet_id"],
+                self.settings["sheet_name"],
+                item.row_number,
+                self.count_backfill_col,
+                str(int(count)),
+            )
+            self.log.emit(f"第 {item.row_number} 行数量回填：{count} → 列 {self.count_backfill_col}")
+        except Exception as exc:
+            self._handle_backfill_error(item, exc, "数量回填")
+
+    def download_drive_folder(self, client, item):
+        """解析云端文件夹 → 下载到本地分类目录 → 返回 (file_count, status)。
+        status: success | skipped | failed
+        """
+        folder_id = extract_drive_folder_id(item.url)
+        if not folder_id:
+            raise RuntimeError("无法解析云端文件夹 ID")
+
+        self.log.emit(f"第 {item.row_number} 行：解析云端文件夹 {folder_id} …")
+        remote_files = client.list_folder_files(folder_id, recursive=True)
+        file_count = len(remote_files)
+        local_dir = folder_local_dir(self.output_dir, item)
+        self.log.emit(f"第 {item.row_number} 行：文件夹内可下载文件 {file_count} 个 → {local_dir}")
+
+        if self.skip_existing and folder_download_complete(local_dir, folder_id, remote_files):
+            self.log.emit(f"第 {item.row_number} 行：同一文件夹已下载完成，跳过")
+            self.try_backfill(client, item, item.source_name or item.group_name)
+            self.try_backfill_count(client, item, file_count)
+            return file_count, "skipped"
+
+        if file_count == 0:
+            write_folder_marker(local_dir, folder_id, item.url, 0, [])
+            self.try_backfill(client, item, item.source_name or item.group_name)
+            self.try_backfill_count(client, item, 0)
+            self.log.emit(f"第 {item.row_number} 行：文件夹为空，已回填数量 0")
+            return 0, "success"
+
+        ok = 0
+        for idx, remote in enumerate(remote_files, 1):
+            if self.stop_event.is_set():
+                raise RuntimeError("任务已停止")
+            rel = str(remote.get("relative_path") or remote.get("name") or f"file_{idx}")
+            target_path = os.path.join(local_dir, rel)
+            if self.skip_existing and os.path.isfile(target_path):
+                ok += 1
+                continue
+            # 同名冲突时 unique_path，但相对路径标记仍用原 rel
+            save_as = target_path if not os.path.exists(target_path) else unique_path(target_path)
+            client.download_drive_file(remote["id"], save_as, self.stop_event)
+            ok += 1
+            if idx == 1 or idx % 5 == 0 or idx == file_count:
+                self.log.emit(f"第 {item.row_number} 行文件夹进度：{idx}/{file_count} {rel}")
+
+        rels = [str(f.get("relative_path") or f.get("name") or "") for f in remote_files]
+        write_folder_marker(local_dir, folder_id, item.url, file_count, rels)
+        self.try_backfill(client, item, item.source_name or item.group_name)
+        self.try_backfill_count(client, item, file_count)
+        self.log.emit(f"第 {item.row_number} 行文件夹完成：{ok}/{file_count} → {local_dir}")
+        return file_count, "success"
 
     def run(self):
         success = 0
@@ -297,18 +548,25 @@ class DownloadWorker(WorkerBase):
             public_downloader = PublicDownloader()
             if self.pasted_items is not None:
                 items = list(self.pasted_items)
+                # 粘贴模式：只下载粘贴的链接，不遍历表格链接列；需要回填时只读名称列匹配行号
+                if self.backfill_enabled and self.settings and self.settings.get("spreadsheet_id"):
+                    client = self.make_client()
+                    items = resolve_paste_items_to_sheet_rows(
+                        client, items, self.settings, log_emit=self.log.emit
+                    )
+                self.log.emit(f"粘贴下载：{len(items)} 条链接（不扫描表格链接列）。")
             else:
                 client = self.make_client()
                 settings = dict(self.settings)
-                scan_all = settings.pop("scan_all", False)
-                if scan_all:
-                    for info in client.list_sheets(settings["spreadsheet_id"]):
-                        if info.title == settings["sheet_name"] and info.row_count:
-                            settings["end_row"] = info.row_count
-                            self.log.emit(f"已刷新结束行：{info.row_count}")
-                            break
+                settings["start_row"] = 2
+                settings.pop("scan_all", None)
+                for info in client.list_sheets(settings["spreadsheet_id"]):
+                    if info.title == settings["sheet_name"] and info.row_count:
+                        settings["end_row"] = max(int(info.row_count), 2)
+                        self.log.emit(f"整列扫描至第 {settings['end_row']} 行")
+                        break
                 items = client.read_items(**settings)
-            self.log.emit(f"准备下载 {len(items)} 行。")
+                self.log.emit(f"表格链接列下载：准备 {len(items)} 行。")
 
             for item in items:
                 if self.stop_event.is_set():
@@ -320,12 +578,20 @@ class DownloadWorker(WorkerBase):
                     self.log.emit(f"第 {item.row_number} 行跳过：没有链接")
                     continue
 
-                if re.search(r"drive\.google\.com/(?:drive/(?:u/\d+/)?folders|folderview)", item.url, re.I):
-                    skipped += 1
-                    self.log.emit(f"第 {item.row_number} 行跳过：文件夹链接")
-                    continue
-
                 try:
+                    # ----- 云端文件夹：解析数量 + 按分类下载 + 回填数量 -----
+                    if is_drive_folder_url(item.url):
+                        if client is None:
+                            client = self.make_client()
+                        _count, status = self.download_drive_folder(client, item)
+                        if status == "skipped":
+                            skipped += 1
+                        else:
+                            success += 1
+                        self.progress.emit({"success": success, "skipped": skipped, "failed": failed})
+                        time.sleep(0.05)
+                        continue
+
                     file_id, _ = extract_drive_file_info(item.url)
                     if file_id:
                         if client is None:
@@ -336,8 +602,11 @@ class DownloadWorker(WorkerBase):
                             skipped += 1
                             self.log.emit(f"已存在，跳过：{target_path}")
                             self.try_backfill(client, item, source_name)
+                            # 单文件数量视为 1
+                            self.try_backfill_count(client, item, 1)
                             continue
                         saved_path = client.download_drive_file(file_id, unique_path(target_path), self.stop_event)
+                        self.try_backfill_count(client, item, 1)
                     else:
                         source_name = item.source_name or public_downloader.prepare_name(item.url)
                         target_path = build_target_path(self.output_dir, item, source_name)
@@ -345,8 +614,10 @@ class DownloadWorker(WorkerBase):
                             skipped += 1
                             self.log.emit(f"已存在，跳过：{target_path}")
                             self.try_backfill(client, item, source_name)
+                            self.try_backfill_count(client, item, 1)
                             continue
                         saved_path = public_downloader.download(item.url, unique_path(target_path))
+                        self.try_backfill_count(client, item, 1)
 
                     success += 1
                     self.try_backfill(client, item, source_name)
@@ -391,14 +662,24 @@ class PasteLinksDialog(QDialog):
         layout.setContentsMargins(18, 16, 18, 16)
         layout.setSpacing(10)
 
-        tip = QLabel("支持从表格复制的超链接、HTML 链接、纯文本 URL。粘贴链接下载不需要填写表格 ID 和回填列。")
+        tip = QLabel(
+            "只下载你粘贴的链接，不会遍历表格「链接列」。\n"
+            "若主界面已填表格 ID / 工作表并勾选回填：下载后会按「名字」匹配名称列写入名字与数量；\n"
+            "也可写行号：12 张三 https://drive.google.com/drive/folders/..."
+        )
         tip.setObjectName("subtitle")
+        tip.setWordWrap(True)
         layout.addWidget(tip)
 
         self.text_box = QTextEdit()
         self.text_box.setObjectName("pasteTextBox")
         self.text_box.setAcceptRichText(True)
-        self.text_box.setPlaceholderText("在这里粘贴链接，例如：\n张三-文件名.mp4  https://drive.google.com/file/d/...\n或直接从 Google 表格复制带超链接的单元格。")
+        self.text_box.setPlaceholderText(
+            "粘贴示例：\n"
+            "张三  https://drive.google.com/drive/folders/xxxx\n"
+            "12 李四  https://drive.google.com/drive/folders/yyyy\n"
+            "或从 Google 表格复制带超链接的名字单元格。"
+        )
         layout.addWidget(self.text_box, 1)
 
         buttons = QHBoxLayout()
@@ -535,7 +816,7 @@ class MainWindow(QMainWindow):
 
         title = QLabel(APP_NAME)
         title.setObjectName("title")
-        subtitle = QLabel(f"v{APP_VERSION} · 表格下载 · 视频下载 · 云端上传")
+        subtitle = QLabel(f"v{APP_VERSION} · 表格下载 · 粘贴链接 · 视频 · 云端上传")
         subtitle.setObjectName("subtitle")
         title_box = QVBoxLayout()
         title_box.setSpacing(1)
@@ -576,7 +857,7 @@ class MainWindow(QMainWindow):
         sheets_h = QHBoxLayout(sheets_page)
         sheets_h.setContentsMargins(8, 8, 8, 8)
         sheets_h.setSpacing(12)
-        self.main_tabs.addTab(sheets_page, "表格 / 粘贴链接")
+        self.main_tabs.addTab(sheets_page, "表格下载")
 
         sheets_left_scroll = QScrollArea()
         sheets_left_scroll.setObjectName("pageFill")
@@ -612,14 +893,9 @@ class MainWindow(QMainWindow):
         self.name_col_edit = QLineEdit("A")
         self.link_col_edit = QLineEdit("P")
         self.backfill_col_edit = QLineEdit("Q")
-        self.start_spin = QSpinBox()
-        self.start_spin.setRange(1, 999999)
-        self.start_spin.setValue(2)
-        self.start_spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
-        self.end_spin = QSpinBox()
-        self.end_spin.setRange(1, 999999)
-        self.end_spin.setValue(100)
-        self.end_spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+        self.backfill_col_edit.setToolTip("下载成功后回填名字（匹配人名/源名）")
+        self.count_backfill_col_edit = QLineEdit("R")
+        self.count_backfill_col_edit.setToolTip("云端文件夹解析出的文件数量回填列（可自定义，留空则不回填数量）")
         self.folder_mode_combo = QComboBox()
         self.folder_mode_combo.addItems(["按人名", "按编号前缀", "按A列完整名称"])
         self.keyword_edit = QLineEdit()
@@ -668,8 +944,16 @@ class MainWindow(QMainWindow):
         panel_layout.addLayout(load_row)
         add_v("工作表", self.sheet_combo)
 
+        tip_scan = QLabel(
+            "推荐：用「粘贴链接下载」只下粘贴内容并回填名字/数量（不扫链接列）。"
+            "「预览/开始下载」才会读链接列整列扫描。支持文件与云端文件夹。"
+        )
+        tip_scan.setObjectName("subtitle")
+        tip_scan.setWordWrap(True)
+        panel_layout.addWidget(tip_scan)
+
         cols = QHBoxLayout()
-        for lab, w in (("名称列", self.name_col_edit), ("链接列", self.link_col_edit), ("回填列", self.backfill_col_edit)):
+        for lab, w in (("名称列", self.name_col_edit), ("链接列(可选)", self.link_col_edit)):
             box = QVBoxLayout()
             c = QLabel(lab)
             c.setObjectName("fieldLabel")
@@ -677,26 +961,26 @@ class MainWindow(QMainWindow):
             box.addWidget(w)
             cols.addLayout(box)
         panel_layout.addLayout(cols)
+        self.link_col_edit.setToolTip("仅「表格整列扫描下载」需要。粘贴链接下载可不填、不遍历此列。")
+        self.name_col_edit.setToolTip("粘贴回填时用此列匹配行号；也用于整列扫描时的分类命名。")
 
-        rows = QHBoxLayout()
-        for lab, w in (("起始行", self.start_spin), ("结束行", self.end_spin)):
+        bf_cols = QHBoxLayout()
+        for lab, w in (("名字回填列", self.backfill_col_edit), ("数量回填列", self.count_backfill_col_edit)):
             box = QVBoxLayout()
             c = QLabel(lab)
             c.setObjectName("fieldLabel")
             box.addWidget(c)
             box.addWidget(w)
-            rows.addLayout(box)
-        panel_layout.addLayout(rows)
-        add_v("文件夹命名", self.folder_mode_combo)
+            bf_cols.addLayout(box)
+        panel_layout.addLayout(bf_cols)
+
+        add_v("文件夹命名（本地分类）", self.folder_mode_combo)
         add_v("只下载包含", self.keyword_edit)
 
-        self.scan_all_check = QCheckBox("扫描整个工作表")
-        self.scan_all_check.setChecked(True)
-        self.skip_existing_check = QCheckBox("已下载过则跳过")
+        self.skip_existing_check = QCheckBox("已下载过则跳过（同链接/同文件）")
         self.skip_existing_check.setChecked(True)
-        self.backfill_check = QCheckBox("下载成功后回填表格")
+        self.backfill_check = QCheckBox("下载成功后回填表格（名字 + 数量）")
         self.backfill_check.setChecked(True)
-        panel_layout.addWidget(self.scan_all_check)
         panel_layout.addWidget(self.skip_existing_check)
         panel_layout.addWidget(self.backfill_check)
 
@@ -711,8 +995,9 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(False)
         self.open_folder_btn = QPushButton("打开文件夹")
         self.open_folder_btn.setObjectName("secondaryButton")
-        self.paste_links_btn = QPushButton("粘贴链接下载")
+        self.paste_links_btn = QPushButton("打开「粘贴链接下载」板块 →")
         self.paste_links_btn.setObjectName("secondaryButton")
+        self.paste_links_btn.setToolTip("独立板块：按表格链接列匹配粘贴链接并回填状态/数量/人员/日期")
         self.clear_log_btn = QPushButton("清空日志")
         self.clear_log_btn.setObjectName("ghostButton")
         for b in (
@@ -753,11 +1038,18 @@ class MainWindow(QMainWindow):
         self.status_row.setObjectName("status")
         sheets_right.addWidget(self.status_row)
 
-        # ========== 页 1：视频（板块内左右由 VideoBatchPage 负责）==========
+        # ========== 页 1：粘贴链接下载（独立板块）==========
+        self.paste_page = PasteLinkDownloadPage(
+            credentials_supplier=lambda: self.credentials_edit.text().strip(),
+            token_path=self.token_file_path,
+        )
+        self.main_tabs.addTab(self.paste_page, "粘贴链接下载")
+
+        # ========== 页 2：视频 ==========
         self.video_page = VideoBatchPage()
         self.main_tabs.addTab(self.video_page, "YouTube / FB 视频")
 
-        # ========== 页 2：上传（左设置 / 右任务进度回执）==========
+        # ========== 页 3：上传 ==========
         self.upload_page = DriveBatchUploadPage(
             credentials_supplier=lambda: self.credentials_edit.text().strip(),
             token_path=self.token_file_path,
@@ -770,14 +1062,14 @@ class MainWindow(QMainWindow):
         self.refresh_btn.clicked.connect(self.refresh_sheet_info)
         self.start_btn.clicked.connect(self.start_download)
         self.stop_btn.clicked.connect(self.stop_download)
-        self.paste_links_btn.clicked.connect(self.open_paste_links_dialog)
+        self.paste_links_btn.clicked.connect(self.goto_paste_link_tab)
         self.open_folder_btn.clicked.connect(self.open_output_folder)
         self.clear_log_btn.clicked.connect(self.log_box.clear)
         self.guide_btn.clicked.connect(self.show_usage_guide)
         self.help_btn.clicked.connect(self.show_help)
         self.update_btn.clicked.connect(lambda: self.check_updates(silent=False))
         self.theme_check.toggled.connect(self.apply_style)
-        self.sheet_combo.currentTextChanged.connect(self.sync_sheet_end_row)
+        # 整列扫描，无需同步结束行
         self.config_combo.currentTextChanged.connect(self.apply_selected_config)
         self.save_config_btn.clicked.connect(self.save_current_config)
         self.delete_config_btn.clicked.connect(self.delete_current_config)
@@ -787,8 +1079,16 @@ class MainWindow(QMainWindow):
 
     def _on_tab_changed(self, index: int):
         # 切到上传页时只刷新共用凭据显示（表格 ID 各自独立）
-        if index == 2 and hasattr(self, "upload_page"):
+        if index == 3 and hasattr(self, "upload_page"):
             self.upload_page.refresh_credentials_label()
+
+    def goto_paste_link_tab(self):
+        """表格页按钮跳转到独立「粘贴链接下载」板块。"""
+        if hasattr(self, "paste_page"):
+            idx = self.main_tabs.indexOf(self.paste_page)
+            if idx >= 0:
+                self.main_tabs.setCurrentIndex(idx)
+                self.log("已切换到「粘贴链接下载」独立板块。")
 
     def _notify_shared_credentials(self, *_args):
         if hasattr(self, "upload_page"):
@@ -854,11 +1154,11 @@ class MainWindow(QMainWindow):
             "name_col": self.name_col_edit.text(),
             "link_col": self.link_col_edit.text(),
             "backfill_col": self.backfill_col_edit.text(),
-            "start_row": self.start_spin.value(),
-            "end_row": self.end_spin.value(),
+            "count_backfill_col": self.count_backfill_col_edit.text(),
+            "start_row": 2,
+            "scan_all": True,
             "folder_mode": self.folder_mode_combo.currentText(),
             "keyword": self.keyword_edit.text(),
-            "scan_all": self.scan_all_check.isChecked(),
             "skip_existing": self.skip_existing_check.isChecked(),
             "backfill": self.backfill_check.isChecked(),
         }
@@ -936,13 +1236,11 @@ class MainWindow(QMainWindow):
         self.name_col_edit.setText(cfg.get("name_col", "A"))
         self.link_col_edit.setText(cfg.get("link_col", "P"))
         self.backfill_col_edit.setText(cfg.get("backfill_col", "Q"))
-        self.start_spin.setValue(int(cfg.get("start_row", 2) or 2))
-        self.end_spin.setValue(int(cfg.get("end_row", 100) or 100))
+        self.count_backfill_col_edit.setText(cfg.get("count_backfill_col", "R"))
         folder_mode = cfg.get("folder_mode", "按人名")
         if self.folder_mode_combo.findText(folder_mode) >= 0:
             self.folder_mode_combo.setCurrentText(folder_mode)
         self.keyword_edit.setText(cfg.get("keyword", ""))
-        self.scan_all_check.setChecked(bool(cfg.get("scan_all", True)))
         self.skip_existing_check.setChecked(bool(cfg.get("skip_existing", True)))
         self.backfill_check.setChecked(bool(cfg.get("backfill", True)))
         self.log(f"已切换配置方案：{name}")
@@ -1191,6 +1489,9 @@ class MainWindow(QMainWindow):
         upload_page = getattr(self, "upload_page", None)
         if upload_page is not None and hasattr(upload_page, "apply_page_fill"):
             upload_page.apply_page_fill(bg)
+        paste_page = getattr(self, "paste_page", None)
+        if paste_page is not None and hasattr(paste_page, "apply_page_fill"):
+            paste_page.apply_page_fill(bg)
 
     def log(self, message):
         now = time.strftime("%H:%M:%S")
@@ -1363,16 +1664,14 @@ class MainWindow(QMainWindow):
             "【全局设置】（标题栏「暗黑模式」左侧）\n"
             "1. 点「⚙ 全局设置」选择 Google 凭据 JSON（各功能共用）。\n"
             "2. 授权 token 保存在本机，授权一次后表格下载与云端上传可共用。\n\n"
-            "【表格 / 粘贴链接】\n"
-            "1. 在全局设置中选好凭据，再选下载目录。\n"
-            "2. 填写 Google 表格 ID，点击“加载工作表”或“刷新表格”。\n"
-            "3. 设置名称列、链接列、起止行、文件夹命名和回填列。\n"
-            "4. 可在“只下载包含”输入人名，例如：张三 或 张三-李四。\n"
-            "5. 表格模式下先点“预览读取”确认，再点“开始下载”。\n"
-            "6. 也可以点“粘贴链接下载”，粘贴从表格复制的超链接或纯文本链接；这种方式不需要表格 ID 和回填列。\n"
-            "   粘贴预览后，主界面的“开始下载”会直接下载当前预览里的粘贴链接。\n"
-            "   没有填写表格 ID 时，直接点“开始下载”也会进入粘贴链接下载。\n"
-            "7. 多个保存方案可以点“执行所有方案”按顺序自动下载。\n\n"
+            "【表格下载】\n"
+            "1. 全局设置选好凭据；本页配置下载目录与表格列，整列扫描链接下载。\n"
+            "2. 适合按表格链接列批量下载。\n\n"
+            "【粘贴链接下载】（独立板块）\n"
+            "1. 填写表格 ID，名称列/链接列，配置回填列。\n"
+            "2. 粘贴后直接「开始下载」：自动匹配 → 下载 → 回填。\n"
+            "3. 支持暂停/继续、按 Drive 文件 ID 排重、文件夹断点续传。\n"
+            "4. 状态：正在下载 → 已下载完成；回填数量、人员、日期。\n\n"
             "【YouTube / FB 视频】（独立板块）\n"
             "1. 切换到“YouTube / FB 视频”标签页。\n"
             "2. 粘贴单视频、播放列表或多个链接（支持批量）。\n"
@@ -1394,13 +1693,10 @@ class MainWindow(QMainWindow):
             self,
             APP_TITLE,
             "规则说明：\n"
-            "• 默认读取 P 列链接，A 列用于创建文件夹。\n"
-            "• 文件名使用链接单元格显示的源文件名，不再用行号命名。\n"
-            "• 粘贴链接支持 HTML 超链接和纯文本 URL；纯 Drive 链接会自动查询真实文件名。\n"
-            "• 表格 ID、工作表、回填列只用于表格读取模式；粘贴链接下载不会回填表格。\n"
-            "• 下载成功后可把匹配到的人名写入 Q 列，失败不会写入。\n"
-            "• 勾选“扫描整个工作表”时，预览和下载都会自动刷新最新结束行。\n"
-            "• 勾选“已下载过则跳过”时，本地已有同名文件会跳过。\n"
+            "• 「表格下载」默认整列扫描链接列；「粘贴链接下载」是独立板块。\n"
+            "• 粘贴板块：用名称列+链接列建索引，粘贴链接按 ID 匹配行号后下载并回填。\n"
+            "• 粘贴回填可配：数量、状态(正在下载/已下载完成)、下载人员、完成日期。\n"
+            "• 支持 Drive 单文件与文件夹；文件夹递归下载并统计可下载文件数。\n"
             "• 如果回填提示权限不足，删除 token.json 后重新授权即可。\n"
             "• YouTube / Facebook 视频板块基于 yt-dlp，与表格下载相互独立。\n"
             "• 支持 YouTube 单视频与播放列表、批量多链接、断点续传。\n"
@@ -1412,15 +1708,28 @@ class MainWindow(QMainWindow):
         self.load_sheets()
 
     def items_to_preview_rows(self, items):
-        return [{
-            "row_number": item.row_number,
-            "folder": item.group_name,
-            "match_name": item.match_name,
-            "source_name": item.source_name,
-            "title": item.title,
-            "has_link": bool(item.url and item.url.startswith("http")),
-            "url": item.url,
-        } for item in items]
+        rows = []
+        for item in items:
+            is_folder = bool(item.url and is_drive_folder_url(item.url))
+            has_link = bool(item.url and item.url.startswith("http"))
+            if is_folder:
+                link_state = "文件夹"
+            elif has_link:
+                link_state = "有链接"
+            else:
+                link_state = "无链接"
+            rows.append({
+                "row_number": item.row_number,
+                "folder": item.group_name,
+                "match_name": item.match_name,
+                "source_name": item.source_name,
+                "title": item.title,
+                "has_link": has_link,
+                "is_folder": is_folder,
+                "link_state": link_state,
+                "url": item.url,
+            })
+        return rows
 
     def open_paste_links_dialog(self):
         if self.has_running_worker():
@@ -1447,23 +1756,43 @@ class MainWindow(QMainWindow):
             return
         self.start_pasted_download(items)
 
+    def paste_backfill_settings(self) -> dict:
+        """粘贴下载回填用：只需表格 ID / 工作表 / 名称列，不读链接列。"""
+        sid = self.spreadsheet_edit.text().strip()
+        sheet = self.sheet_combo.currentText().strip()
+        if not sid or not sheet:
+            return {}
+        return {
+            "spreadsheet_id": sid,
+            "sheet_name": sheet,
+            "name_col": self.name_col_edit.text().strip() or "A",
+        }
+
     def start_pasted_download(self, items):
         output_dir = self.output_edit.text().strip()
         if not output_dir:
             QMessageBox.warning(self, APP_TITLE, "请先选择下载目录。")
             return
+        settings = self.paste_backfill_settings()
+        want_backfill = self.backfill_check.isChecked() and bool(settings)
+        if self.backfill_check.isChecked() and not settings:
+            self.log(
+                "已勾选回填，但未填表格 ID 或工作表：将只下载不回填。"
+                "填好表格并加载工作表后，粘贴下载可按名称列匹配行并回填名字/数量。"
+            )
         self.running_all_configs = False
         self.config_queue = []
         self.set_running_state(True)
-        self.status_row.setText("正在下载粘贴链接...")
+        self.status_row.setText("正在下载粘贴链接（不扫描链接列）...")
         worker = DownloadWorker(
             self.credentials_edit.text(),
             self.token_file_path,
-            {},
+            settings,
             output_dir,
             self.skip_existing_check.isChecked(),
-            False,
-            "",
+            want_backfill,
+            self.backfill_col_edit.text().strip() if want_backfill else "",
+            self.count_backfill_col_edit.text().strip() if want_backfill else "",
             pasted_items=items,
         )
         worker.log.connect(self.log)
@@ -1477,14 +1806,17 @@ class MainWindow(QMainWindow):
         return {
             "spreadsheet_id": str(cfg.get("spreadsheet_id", "")).strip(),
             "sheet_name": str(cfg.get("sheet_name", "")).strip(),
-            "start_row": int(cfg.get("start_row", 2) or 2),
-            "end_row": int(cfg.get("end_row", 100) or 100),
+            "start_row": 2,
+            "end_row": int(cfg.get("end_row", 5000) or 5000),
             "name_col": str(cfg.get("name_col", "A")).strip(),
             "link_col": str(cfg.get("link_col", "P")).strip(),
             "group_mode": str(cfg.get("folder_mode", "按人名")).strip(),
             "keyword": str(cfg.get("keyword", "")).strip(),
-            "scan_all": bool(cfg.get("scan_all", True)),
+            "scan_all": True,
         }
+
+    def count_backfill_col_from_config(self, cfg) -> str:
+        return str(cfg.get("count_backfill_col", self.count_backfill_col_edit.text() if hasattr(self, "count_backfill_col_edit") else "R") or "").strip()
 
     def set_running_state(self, running):
         self.refresh_btn.setEnabled(not running)
@@ -1537,6 +1869,7 @@ class MainWindow(QMainWindow):
             bool(cfg.get("skip_existing", True)),
             bool(cfg.get("backfill", True)),
             str(cfg.get("backfill_col", "Q")).strip(),
+            self.count_backfill_col_from_config(cfg),
         )
         worker.log.connect(self.log)
         worker.failed.connect(self.show_error)
@@ -1546,19 +1879,18 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def settings(self):
-        end_row = self.end_spin.value()
-        if self.scan_all_check.isChecked():
-            end_row = self.sheet_rows.get(self.sheet_combo.currentText(), end_row)
+        # 始终整列：end_row 由 worker 按工作表真实行数刷新
+        end_row = self.sheet_rows.get(self.sheet_combo.currentText(), 5000) or 5000
         return {
             "spreadsheet_id": self.spreadsheet_edit.text().strip(),
             "sheet_name": self.sheet_combo.currentText().strip(),
-            "start_row": self.start_spin.value(),
-            "end_row": end_row,
+            "start_row": 2,
+            "end_row": int(end_row),
             "name_col": self.name_col_edit.text().strip(),
             "link_col": self.link_col_edit.text().strip(),
             "group_mode": self.folder_mode_combo.currentText(),
             "keyword": self.keyword_edit.text().strip(),
-            "scan_all": self.scan_all_check.isChecked(),
+            "scan_all": True,
         }
 
     def load_sheets(self):
@@ -1585,14 +1917,8 @@ class MainWindow(QMainWindow):
         self.sheet_combo.addItems([title for title, _ in sheets])
         if current_sheet and self.sheet_combo.findText(current_sheet) >= 0:
             self.sheet_combo.setCurrentText(current_sheet)
-        self.sync_sheet_end_row()
-        self.status_row.setText(f"已加载 {len(sheets)} 个工作表")
+        self.status_row.setText(f"已加载 {len(sheets)} 个工作表（整列扫描）")
         self.pending_sheet_name = ""
-
-    def sync_sheet_end_row(self):
-        row_count = self.sheet_rows.get(self.sheet_combo.currentText())
-        if row_count:
-            self.end_spin.setValue(row_count)
 
     def preview_items(self):
         if not self.sheet_combo.currentText():
@@ -1617,19 +1943,25 @@ class MainWindow(QMainWindow):
     def fill_preview(self, rows):
         self.preview_table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
+            link_state = row.get("link_state") or ("有链接" if row.get("has_link") else "无链接")
             values = [
                 row.get("row_number"),
                 row.get("folder"),
                 row.get("match_name"),
                 row.get("source_name"),
                 row.get("title"),
-                "有链接" if row["has_link"] else "无链接",
+                link_state,
                 row.get("url"),
             ]
             for col, value in enumerate(values):
                 item = QTableWidgetItem("" if value is None else str(value))
                 if col == 5:
-                    item.setForeground(QColor("#15803d" if row["has_link"] else "#dc2626"))
+                    if row.get("is_folder"):
+                        item.setForeground(QColor("#38bdf8"))
+                    elif row.get("has_link"):
+                        item.setForeground(QColor("#15803d"))
+                    else:
+                        item.setForeground(QColor("#dc2626"))
                 self.preview_table.setItem(row_index, col, item)
         self.status_row.setText(f"预览完成：显示 {len(rows)} 行")
 
@@ -1665,6 +1997,7 @@ class MainWindow(QMainWindow):
             self.skip_existing_check.isChecked(),
             self.backfill_check.isChecked(),
             self.backfill_col_edit.text().strip(),
+            self.count_backfill_col_edit.text().strip(),
         )
         worker.log.connect(self.log)
         worker.failed.connect(self.show_error)
@@ -1693,6 +2026,10 @@ class MainWindow(QMainWindow):
                 self.status_row.setText("任务仍在停止中，请稍后再关闭")
                 self.log("任务仍在停止中，已取消关闭窗口。")
                 return
+        if hasattr(self, "paste_page") and not self.paste_page.request_close():
+            event.ignore()
+            self.log("粘贴链接下载任务仍在进行，已取消关闭窗口。")
+            return
         if hasattr(self, "video_page") and not self.video_page.request_close():
             event.ignore()
             self.log("视频下载任务仍在停止中，已取消关闭窗口。")
