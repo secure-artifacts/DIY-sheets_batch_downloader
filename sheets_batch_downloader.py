@@ -12,9 +12,10 @@ from urllib.request import Request, urlopen
 
 
 APP_TITLE = "DIY下载器"
+# drive 写权限用于「批量上传云端」；旧 token 仅有 drive.readonly 时会要求重新授权
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/drive",
 ]
 
 
@@ -39,14 +40,22 @@ def require_google_libs():
         from google.oauth2.credentials import Credentials
         from google_auth_oauthlib.flow import InstalledAppFlow
         from googleapiclient.discovery import build
-        from googleapiclient.http import MediaIoBaseDownload
+        from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
     except ImportError as exc:
         raise RuntimeError(
             "缺少 Google API 依赖，请先运行：\n"
             "pip install -r requirements_google.txt"
         ) from exc
 
-    return GoogleAuthRequest, service_account, Credentials, InstalledAppFlow, build, MediaIoBaseDownload
+    return (
+        GoogleAuthRequest,
+        service_account,
+        Credentials,
+        InstalledAppFlow,
+        build,
+        MediaIoBaseDownload,
+        MediaFileUpload,
+    )
 
 
 def sanitize_path_part(value: str) -> str:
@@ -323,8 +332,17 @@ class DownloadItem:
 
 class GoogleClient:
     def __init__(self, credentials_path: str, token_path: str):
-        GoogleAuthRequest, service_account, Credentials, InstalledAppFlow, build, MediaIoBaseDownload = require_google_libs()
+        (
+            GoogleAuthRequest,
+            service_account,
+            Credentials,
+            InstalledAppFlow,
+            build,
+            MediaIoBaseDownload,
+            MediaFileUpload,
+        ) = require_google_libs()
         self.MediaIoBaseDownload = MediaIoBaseDownload
+        self.MediaFileUpload = MediaFileUpload
 
         if not os.path.exists(credentials_path):
             raise RuntimeError("找不到凭据 JSON 文件。")
@@ -443,6 +461,194 @@ class GoogleClient:
             range=cell,
             valueInputOption="RAW",
             body={"values": [[value]]},
+        ).execute()
+
+    # ---------- Drive 上传 / 入库表 ----------
+
+    def ensure_sheet(self, spreadsheet_id: str, sheet_name: str, headers=None):
+        infos = self.list_sheets(spreadsheet_id)
+        titles = {info.title for info in infos}
+        if sheet_name in titles:
+            return
+        body = {"requests": [{"addSheet": {"properties": {"title": sheet_name}}}]}
+        self.sheets.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=body).execute()
+        if headers:
+            self.sheets.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range=f"{quote_sheet_name(sheet_name)}!A1",
+                valueInputOption="RAW",
+                body={"values": [headers]},
+            ).execute()
+
+    def read_category_rows(self, spreadsheet_id: str, sheet_name: str = "分类目录"):
+        """读取分类目录：A-D 列，空白一级/二级向下继承。返回 [[c1,c2,c3,c4], ...]"""
+        result = self.sheets.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=f"{quote_sheet_name(sheet_name)}!A2:D",
+        ).execute()
+        values = result.get("values") or []
+        current_c1 = ""
+        current_c2 = ""
+        rows = []
+        for raw in values:
+            padded = list(raw) + [""] * (4 - len(raw))
+            c1 = str(padded[0] or "").strip()
+            c2 = str(padded[1] or "").strip()
+            c3 = str(padded[2] or "").strip()
+            c4 = str(padded[3] or "").strip()
+            if c1:
+                current_c1 = c1
+            else:
+                c1 = current_c1
+            if c2:
+                current_c2 = c2
+            else:
+                c2 = current_c2
+            if not c1 and not c2 and not c3 and not c4:
+                continue
+            rows.append([c1, c2, c3, c4])
+        return rows
+
+    def find_child_folder(self, parent_id: str, name: str):
+        safe = str(name or "").replace("'", "\\'")
+        query = (
+            f"'{parent_id}' in parents and trashed=false and "
+            f"mimeType='application/vnd.google-apps.folder' and name='{safe}'"
+        )
+        result = self.drive.files().list(
+            q=query,
+            spaces="drive",
+            fields="files(id,name)",
+            pageSize=10,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+        files = result.get("files") or []
+        return files[0]["id"] if files else ""
+
+    def create_folder(self, parent_id: str, name: str):
+        meta = {
+            "name": str(name or "未命名"),
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [parent_id],
+        }
+        created = self.drive.files().create(
+            body=meta,
+            fields="id,name,webViewLink",
+            supportsAllDrives=True,
+        ).execute()
+        return created["id"]
+
+    def get_or_create_folder_path(self, root_folder_id: str, path_parts):
+        current = str(root_folder_id or "").strip()
+        if not current:
+            raise RuntimeError("父文件夹 ID 为空")
+        for part in path_parts:
+            name = str(part or "").strip()
+            if not name:
+                continue
+            found = self.find_child_folder(current, name)
+            if found:
+                current = found
+            else:
+                current = self.create_folder(current, name)
+        meta = self.drive.files().get(
+            fileId=current,
+            fields="id,name,webViewLink",
+            supportsAllDrives=True,
+        ).execute()
+        return meta
+
+    def find_file_in_folder(self, folder_id: str, file_name: str):
+        safe = str(file_name or "").replace("'", "\\'")
+        query = (
+            f"'{folder_id}' in parents and trashed=false and "
+            f"mimeType!='application/vnd.google-apps.folder' and name='{safe}'"
+        )
+        result = self.drive.files().list(
+            q=query,
+            spaces="drive",
+            fields="files(id,name,webViewLink)",
+            pageSize=5,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+        files = result.get("files") or []
+        return files[0] if files else None
+
+    def upload_local_file(self, local_path: str, folder_id: str, file_name: str = "", mime_type: str = ""):
+        if not os.path.isfile(local_path):
+            raise RuntimeError(f"本地文件不存在：{local_path}")
+        name = file_name or os.path.basename(local_path)
+        existing = self.find_file_in_folder(folder_id, name)
+        if existing:
+            return existing
+        body = {"name": name, "parents": [folder_id]}
+        media = self.MediaFileUpload(
+            local_path,
+            mimetype=mime_type or "application/octet-stream",
+            resumable=True,
+        )
+        created = self.drive.files().create(
+            body=body,
+            media_body=media,
+            fields="id,name,webViewLink",
+            supportsAllDrives=True,
+        ).execute()
+        return created
+
+    def insert_inbound_row(self, spreadsheet_id: str, sheet_name: str, row_values, insert_before_row: int = 7):
+        """在指定行上方插入一行并写入入库数据（对齐原 Web 端 insertRowBefore(7)）。"""
+        self.ensure_sheet(spreadsheet_id, sheet_name)
+        # 先获取 sheetId
+        meta = self.sheets.spreadsheets().get(
+            spreadsheetId=spreadsheet_id,
+            fields="sheets(properties(sheetId,title))",
+        ).execute()
+        sheet_id = None
+        for sh in meta.get("sheets") or []:
+            props = sh.get("properties") or {}
+            if props.get("title") == sheet_name:
+                sheet_id = props.get("sheetId")
+                break
+        if sheet_id is None:
+            raise RuntimeError(f"找不到工作表：{sheet_name}")
+
+        index = max(0, int(insert_before_row) - 1)
+        self.sheets.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={
+                "requests": [{
+                    "insertDimension": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "dimension": "ROWS",
+                            "startIndex": index,
+                            "endIndex": index + 1,
+                        },
+                        "inheritFromBefore": False,
+                    }
+                }]
+            },
+        ).execute()
+        cell = f"{quote_sheet_name(sheet_name)}!A{insert_before_row}"
+        self.sheets.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=cell,
+            valueInputOption="USER_ENTERED",
+            body={"values": [list(row_values)]},
+        ).execute()
+
+    def append_upload_log(self, spreadsheet_id: str, sheet_name: str, level: str, message: str):
+        self.ensure_sheet(spreadsheet_id, sheet_name, headers=["时间戳", "日志级别", "详细信息"])
+        # 若只有表头或空，直接 append
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        self.sheets.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id,
+            range=f"{quote_sheet_name(sheet_name)}!A:C",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [[ts, level, message]]},
         ).execute()
 
 

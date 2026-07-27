@@ -46,6 +46,7 @@ from sheets_batch_downloader import (
     unique_path,
 )
 from video_batch_downloader import VideoBatchPage
+from drive_batch_uploader import DriveBatchUploadPage
 from version import APP_NAME, APP_VERSION, RELEASES_PAGE
 from updater import (
     check_for_update,
@@ -521,7 +522,7 @@ class MainWindow(QMainWindow):
 
         title = QLabel(APP_NAME)
         title.setObjectName("title")
-        subtitle = QLabel(f"v{APP_VERSION} · 表格/粘贴链接 · YouTube/FB 视频 · 自动更新")
+        subtitle = QLabel(f"v{APP_VERSION} · 表格下载 · 视频下载 · 云端上传 · 自动更新")
         subtitle.setObjectName("subtitle")
         title_box = QVBoxLayout()
         title_box.setSpacing(1)
@@ -554,6 +555,12 @@ class MainWindow(QMainWindow):
 
         self.video_page = VideoBatchPage()
         self.main_tabs.addTab(self.video_page, "YouTube / FB 视频")
+
+        self.upload_page = DriveBatchUploadPage(
+            credentials_supplier=lambda: self.credentials_edit.text().strip(),
+            token_path=self.token_file_path,
+        )
+        self.main_tabs.addTab(self.upload_page, "批量上传云端")
 
         compact_panel = QFrame()
         compact_panel.setObjectName("compactPanel")
@@ -971,7 +978,13 @@ class MainWindow(QMainWindow):
             "4. 可开启断点续传、列表分子文件夹、列表上限。\n"
             "5. 可直接点“开始下载”：会自动加载视频/播放列表，无需先解析。\n"
             "6. “解析预览”可选，只用于提前查看列表。\n"
-            "7. 建议安装 ffmpeg，以便最佳画质音视频合并。"
+            "7. 建议安装 ffmpeg，以便最佳画质音视频合并。\n\n"
+            "【批量上传云端】（独立板块）\n"
+            "1. 切换到“批量上传云端”标签页。\n"
+            "2. 填写表格 ID、Drive 父文件夹 ID，加载「分类目录」。\n"
+            "3. 选择分类模式或图片直传，选择本地文件，加入清单。\n"
+            "4. 点「开始批量上传」：自动建文件夹、上传文件、写入入库表与上传日志。\n"
+            "5. 若提示 Drive 权限不足，删除 token.json 后重新授权。"
         )
 
     def show_help(self):
@@ -1280,6 +1293,10 @@ class MainWindow(QMainWindow):
         if hasattr(self, "video_page") and not self.video_page.request_close():
             event.ignore()
             self.log("视频下载任务仍在停止中，已取消关闭窗口。")
+            return
+        if hasattr(self, "upload_page") and not self.upload_page.request_close():
+            event.ignore()
+            self.log("云端上传任务仍在停止中，已取消关闭窗口。")
             return
         event.accept()
 

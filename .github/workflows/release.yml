@@ -67,6 +67,7 @@ jobs:
             --hidden-import "updater" `
             --hidden-import "env_tools" `
             --hidden-import "video_batch_downloader" `
+            --hidden-import "drive_batch_uploader" `
             "sheets_batch_downloader_modern.py"
 
           if (-not (Test-Path "dist\DIYDownloader\DIYDownloader.exe")) {
@@ -154,6 +155,7 @@ jobs:
             --hidden-import "updater" \
             --hidden-import "env_tools" \
             --hidden-import "video_batch_downloader" \
+            --hidden-import "drive_batch_uploader" \
             "sheets_batch_downloader_modern.py"
 
           mkdir -p release
