@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -41,15 +42,63 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from sheets_batch_downloader import GoogleClient, default_token_path
+from sheets_batch_downloader import (
+    GoogleClient,
+    column_to_number,
+    default_token_path,
+    number_to_column,
+)
 
 
 APP_SECTION = "批量上传云端"
 DEFAULT_PARENT_FOLDER_ID = "1h4rHJ9dojSrK84BftxKnthJz7QuEgj3v"
-DATA_SHEET_NAME = "入库表"
+DATA_SHEET_NAME = "成品入库表"
 CATEGORY_SHEET_NAME = "分类目录"
-LOG_SHEET_NAME = "上传日志"
+LOG_SHEET_NAME = "成品入库表日志"
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".tif", ".tiff"}
+
+# 入库表默认列（可在设置里改）
+DEFAULT_INBOUND_COLS = {
+    "date": "A",
+    "cat1": "B",
+    "cat2": "C",
+    "cat3": "D",
+    "type": "E",
+    "clean_meta": "F",       # 是否清理元数据
+    "reviewer": "G",         # 审核人员
+    "uploader": "H",         # 上传者
+    "copyright": "I",
+    "file_url": "J",
+    "status": "K",
+    "done_date": "L",
+}
+
+
+def normalize_col(letter: str, fallback: str) -> str:
+    text = str(letter or "").strip().upper()
+    if not text:
+        return fallback
+    try:
+        column_to_number(text)
+        return text
+    except Exception:
+        return fallback
+
+
+def build_inbound_values(cells: dict) -> list:
+    """cells: {'A': v, 'F': v, ...} → 从 A 到最大列的连续列表。"""
+    if not cells:
+        return []
+    max_n = 1
+    mapped = {}
+    for col, val in cells.items():
+        c = normalize_col(col, "")
+        if not c:
+            continue
+        n = column_to_number(c)
+        mapped[n] = val
+        max_n = max(max_n, n)
+    return [mapped.get(i, "") for i in range(1, max_n + 1)]
 
 
 @dataclass
@@ -69,6 +118,8 @@ class UploadTask:
     cat3: str = ""
     video_type: str = ""
     uploader: str = ""
+    reviewer: str = ""
+    clean_meta: str = ""  # 写入 F 列的文案，如「是」/「否」
     files: list[UploadFileItem] = field(default_factory=list)
     folder_url: str = ""
     status: str = "待处理"
@@ -244,6 +295,7 @@ class UploadWorker(QThread):
         tasks: list[UploadTask],
         copyright_agreed: bool,
         skip_existing: bool,
+        inbound_cols: dict | None = None,
     ):
         super().__init__()
         self.credentials_path = credentials_path
@@ -255,6 +307,10 @@ class UploadWorker(QThread):
         self.tasks = tasks
         self.copyright_agreed = copyright_agreed
         self.skip_existing = skip_existing
+        cols = dict(DEFAULT_INBOUND_COLS)
+        if inbound_cols:
+            cols.update({k: normalize_col(v, cols.get(k, "A")) for k, v in inbound_cols.items() if k in cols})
+        self.inbound_cols = cols
         self.stop_event = threading.Event()
 
     def stop(self):
@@ -361,11 +417,22 @@ class UploadWorker(QThread):
         else:
             display_cat1, display_cat2, display_cat3 = task.cat1, task.cat2 or "", task.cat3 or ""
             display_type = task.video_type or ""
-        row = [
-            formatted, display_cat1, display_cat2, display_cat3,
-            display_type, "", "", task.uploader,
-            copyright_status, file_url, "已上传", formatted,
-        ]
+        c = self.inbound_cols
+        cells = {
+            c["date"]: formatted,
+            c["cat1"]: display_cat1,
+            c["cat2"]: display_cat2,
+            c["cat3"]: display_cat3,
+            c["type"]: display_type,
+            c["clean_meta"]: task.clean_meta or "",
+            c["reviewer"]: task.reviewer or "",
+            c["uploader"]: task.uploader or "",
+            c["copyright"]: copyright_status,
+            c["file_url"]: file_url or "",
+            c["status"]: "已上传",
+            c["done_date"]: formatted,
+        }
+        row = build_inbound_values(cells)
         client.insert_inbound_row(self.spreadsheet_id, self.data_sheet, row, insert_before_row=7)
 
 
@@ -442,8 +509,8 @@ class DriveBatchUploadPage(QWidget):
         root.setSpacing(10)
 
         tip = QLabel(
-            "凭据请在顶部「⚙ 全局设置」配置（各功能共用）；本页表格 ID 独立（入库/分类目录专用，不与下载页共用）。"
-            "设置可保存并折叠。支持拖入已按分类建好的文件夹，自动匹配一/二/三级。"
+            "凭据请在顶部「⚙ 全局设置」配置。本页表格 ID 独立（成品入库表 / 分类目录 / 日志）。\n"
+            "入库默认：F=是否清理元数据，G=审核人员，H=上传者（列与表名均可改）。"
         )
         tip.setObjectName("subtitle")
         tip.setWordWrap(True)
@@ -453,23 +520,26 @@ class DriveBatchUploadPage(QWidget):
         body.setSpacing(12)
         root.addLayout(body, 1)
 
-        # ----- 左侧 -----
+        # ----- 左侧（加宽，避免设置项挤在一行显示不全）-----
         # 不用 transparent：Windows 上 QScrollArea viewport 默认 Base=白，会透出白底
         left_scroll = QScrollArea()
         left_scroll.setObjectName("pageFill")
         left_scroll.setWidgetResizable(True)
         left_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        left_scroll.setMinimumWidth(360)
-        left_scroll.setMaximumWidth(460)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        left_scroll.setMinimumWidth(480)
+        left_scroll.setMaximumWidth(620)
+        left_scroll.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         left_inner = QWidget()
         left_inner.setObjectName("scrollInner")
         left_inner.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        left_inner.setMinimumWidth(460)
         left = QVBoxLayout(left_inner)
-        left.setContentsMargins(0, 0, 4, 0)
+        left.setContentsMargins(0, 0, 8, 0)
         left.setSpacing(10)
         left_scroll.setWidget(left_inner)
-        body.addWidget(left_scroll, 0)
+        body.addWidget(left_scroll, 2)  # 左侧占更多宽度比例
         self._left_scroll = left_scroll
         self._left_inner = left_inner
         self.apply_page_fill("#0b1120")
@@ -497,29 +567,89 @@ class DriveBatchUploadPage(QWidget):
         sg.addWidget(self.credentials_label)
 
         self.spreadsheet_edit = QLineEdit()
-        self.spreadsheet_edit.setPlaceholderText("上传专用表格 ID（入库表 / 分类目录所在表格，必填）")
+        self.spreadsheet_edit.setPlaceholderText("上传专用表格 ID（成品入库表 / 分类目录所在表格，必填）")
         self.parent_folder_edit = QLineEdit(DEFAULT_PARENT_FOLDER_ID)
         self.data_sheet_edit = QLineEdit(DATA_SHEET_NAME)
         self.category_sheet_edit = QLineEdit(CATEGORY_SHEET_NAME)
         self.log_sheet_edit = QLineEdit(LOG_SHEET_NAME)
         self.uploader_edit = QLineEdit()
         self.uploader_edit.setPlaceholderText("上传者姓名 *")
+        self.reviewer_edit = QLineEdit()
+        self.reviewer_edit.setPlaceholderText("审核人员（写入入库表）")
 
         for label, widget in [
             ("上传专用表格 ID *", self.spreadsheet_edit),
             ("Drive 父文件夹 ID", self.parent_folder_edit),
-            ("入库表名称", self.data_sheet_edit),
-            ("分类目录名称", self.category_sheet_edit),
-            ("上传日志名称", self.log_sheet_edit),
-            ("默认上传者 *", self.uploader_edit),
+            ("成品入库表名称（工作表名，可改）", self.data_sheet_edit),
+            ("分类目录名称（工作表名，可改）", self.category_sheet_edit),
+            ("成品入库表日志名称（工作表名，可改）", self.log_sheet_edit),
+            ("默认上传者 *（写入 H 列，列可改）", self.uploader_edit),
+            ("默认审核人员（写入 G 列，列可改）", self.reviewer_edit),
         ]:
             sg.addWidget(self._labeled(label, widget))
 
+        # 入库列映射：用网格排布，避免单行挤爆宽度
+        col_title = QLabel("入库表列映射（字母可改）")
+        col_title.setObjectName("fieldLabel")
+        col_title.setWordWrap(True)
+        sg.addWidget(col_title)
+
+        self.col_clean_meta_edit = QLineEdit(DEFAULT_INBOUND_COLS["clean_meta"])
+        self.col_reviewer_edit = QLineEdit(DEFAULT_INBOUND_COLS["reviewer"])
+        self.col_uploader_edit = QLineEdit(DEFAULT_INBOUND_COLS["uploader"])
+        self.col_date_edit = QLineEdit(DEFAULT_INBOUND_COLS["date"])
+        self.col_cat1_edit = QLineEdit(DEFAULT_INBOUND_COLS["cat1"])
+        self.col_cat2_edit = QLineEdit(DEFAULT_INBOUND_COLS["cat2"])
+        self.col_cat3_edit = QLineEdit(DEFAULT_INBOUND_COLS["cat3"])
+        self.col_type_edit = QLineEdit(DEFAULT_INBOUND_COLS["type"])
+        self.col_copyright_edit = QLineEdit(DEFAULT_INBOUND_COLS["copyright"])
+        self.col_file_url_edit = QLineEdit(DEFAULT_INBOUND_COLS["file_url"])
+        self.col_status_edit = QLineEdit(DEFAULT_INBOUND_COLS["status"])
+        self.col_done_date_edit = QLineEdit(DEFAULT_INBOUND_COLS["done_date"])
+
+        col_grid = QGridLayout()
+        col_grid.setHorizontalSpacing(10)
+        col_grid.setVerticalSpacing(8)
+        col_items = [
+            ("清理元数据", self.col_clean_meta_edit, "默认 F"),
+            ("审核人员", self.col_reviewer_edit, "默认 G"),
+            ("上传者", self.col_uploader_edit, "默认 H"),
+            ("日期", self.col_date_edit, "默认 A"),
+            ("一级", self.col_cat1_edit, "默认 B"),
+            ("二级", self.col_cat2_edit, "默认 C"),
+            ("三级", self.col_cat3_edit, "默认 D"),
+            ("类型", self.col_type_edit, "默认 E"),
+            ("版权", self.col_copyright_edit, "默认 I"),
+            ("文件链接", self.col_file_url_edit, "默认 J"),
+            ("状态", self.col_status_edit, "默认 K"),
+            ("完成日", self.col_done_date_edit, "默认 L"),
+        ]
+        for i, (lab, w, tip) in enumerate(col_items):
+            r, c = divmod(i, 3)
+            cell = QFrame()
+            cell_l = QVBoxLayout(cell)
+            cell_l.setContentsMargins(0, 0, 0, 0)
+            cell_l.setSpacing(3)
+            cap = QLabel(lab)
+            cap.setObjectName("fieldLabel")
+            cap.setWordWrap(True)
+            w.setToolTip(tip)
+            w.setMinimumWidth(56)
+            w.setMaximumWidth(96)
+            w.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+            cell_l.addWidget(cap)
+            cell_l.addWidget(w)
+            col_grid.addWidget(cell, r, c)
+        sg.addLayout(col_grid)
+
         self.copyright_check = QCheckBox("我保证版权没有问题")
         self.copyright_check.setChecked(True)
-        self.skip_existing_check = QCheckBox("云端同名则跳过（仍写入库表）")
+        self.clean_meta_check = QCheckBox("是否清理元数据（写入 F 列，列可改）")
+        self.clean_meta_check.setChecked(False)
+        self.skip_existing_check = QCheckBox("云端同名则跳过（仍写入成品入库表）")
         self.skip_existing_check.setChecked(True)
         sg.addWidget(self.copyright_check)
+        sg.addWidget(self.clean_meta_check)
         sg.addWidget(self.skip_existing_check)
 
         set_btns = QHBoxLayout()
@@ -604,7 +734,7 @@ class DriveBatchUploadPage(QWidget):
         # ----- 右侧 -----
         right = QVBoxLayout()
         right.setSpacing(10)
-        body.addLayout(right, 1)
+        body.addLayout(right, 3)  # 右侧任务区更大
 
         task_card = Card("任务列表")
         right.addWidget(task_card, 3)
@@ -670,6 +800,9 @@ class DriveBatchUploadPage(QWidget):
         box.setSpacing(4)
         caption = QLabel(label)
         caption.setObjectName("fieldLabel")
+        caption.setWordWrap(True)
+        widget.setMinimumWidth(200)
+        widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         box.addWidget(caption)
         box.addWidget(widget)
         return field
@@ -699,6 +832,29 @@ class DriveBatchUploadPage(QWidget):
         self.settings_toggle.setText("▾  设置（点此折叠）" if expanded else "▸  设置（已折叠，点此展开）")
         self.settings_collapsed = not expanded
 
+    def inbound_cols_from_ui(self) -> dict:
+        d = dict(DEFAULT_INBOUND_COLS)
+        mapping = {
+            "date": self.col_date_edit,
+            "cat1": self.col_cat1_edit,
+            "cat2": self.col_cat2_edit,
+            "cat3": self.col_cat3_edit,
+            "type": self.col_type_edit,
+            "clean_meta": self.col_clean_meta_edit,
+            "reviewer": self.col_reviewer_edit,
+            "uploader": self.col_uploader_edit,
+            "copyright": self.col_copyright_edit,
+            "file_url": self.col_file_url_edit,
+            "status": self.col_status_edit,
+            "done_date": self.col_done_date_edit,
+        }
+        for key, edit in mapping.items():
+            d[key] = normalize_col(edit.text(), d[key])
+        return d
+
+    def clean_meta_text(self) -> str:
+        return "是" if self.clean_meta_check.isChecked() else "否"
+
     def save_settings_and_collapse(self):
         data = {
             "spreadsheet_id": self.spreadsheet_edit.text().strip(),
@@ -707,8 +863,11 @@ class DriveBatchUploadPage(QWidget):
             "category_sheet": self.category_sheet_edit.text().strip(),
             "log_sheet": self.log_sheet_edit.text().strip(),
             "uploader": self.uploader_edit.text().strip(),
+            "reviewer": self.reviewer_edit.text().strip(),
+            "clean_meta": self.clean_meta_check.isChecked(),
             "copyright": self.copyright_check.isChecked(),
             "skip_existing": self.skip_existing_check.isChecked(),
+            "inbound_cols": self.inbound_cols_from_ui(),
             "collapsed": True,
         }
         try:
@@ -741,8 +900,30 @@ class DriveBatchUploadPage(QWidget):
             self.log_sheet_edit.setText(data["log_sheet"])
         if data.get("uploader"):
             self.uploader_edit.setText(data["uploader"])
+        if data.get("reviewer"):
+            self.reviewer_edit.setText(data["reviewer"])
+        self.clean_meta_check.setChecked(bool(data.get("clean_meta", False)))
         self.copyright_check.setChecked(bool(data.get("copyright", True)))
         self.skip_existing_check.setChecked(bool(data.get("skip_existing", True)))
+        cols = data.get("inbound_cols") or {}
+        if isinstance(cols, dict):
+            edit_map = {
+                "date": self.col_date_edit,
+                "cat1": self.col_cat1_edit,
+                "cat2": self.col_cat2_edit,
+                "cat3": self.col_cat3_edit,
+                "type": self.col_type_edit,
+                "clean_meta": self.col_clean_meta_edit,
+                "reviewer": self.col_reviewer_edit,
+                "uploader": self.col_uploader_edit,
+                "copyright": self.col_copyright_edit,
+                "file_url": self.col_file_url_edit,
+                "status": self.col_status_edit,
+                "done_date": self.col_done_date_edit,
+            }
+            for key, edit in edit_map.items():
+                if cols.get(key):
+                    edit.setText(normalize_col(cols[key], DEFAULT_INBOUND_COLS[key]))
         if data.get("collapsed"):
             self.settings_toggle.setChecked(False)
         self.log("已恢复本机上传设置。")
@@ -995,6 +1176,8 @@ class DriveBatchUploadPage(QWidget):
                 cat3="" if is_img else c3,
                 video_type="" if is_img else c4,
                 uploader=uploader,
+                reviewer=self.reviewer_edit.text().strip(),
+                clean_meta=self.clean_meta_text(),
                 files=[UploadFileItem(path=p, name=os.path.basename(p)) for p in files],
                 source_folder=folder,
             )
@@ -1037,7 +1220,10 @@ class DriveBatchUploadPage(QWidget):
             is_image_mode=self.is_image_mode,
             cat1=cat1 if not self.is_image_mode else "图片素材",
             cat2=cat2, cat3=cat3, video_type=vtype,
-            uploader=uploader, files=files,
+            uploader=uploader,
+            reviewer=self.reviewer_edit.text().strip(),
+            clean_meta=self.clean_meta_text(),
+            files=files,
         )
         self.tasks.append(task)
         self.pending_files = []
@@ -1127,6 +1313,19 @@ class DriveBatchUploadPage(QWidget):
         self.set_running(True)
         self.progress_bar.setValue(0)
         self.progress_label.setText("上传中…")
+        # 任务上刷新最新的上传者/审核/元数据设置（加入清单后若改了设置也生效）
+        uploader = self.uploader_edit.text().strip()
+        reviewer = self.reviewer_edit.text().strip()
+        clean_meta = self.clean_meta_text()
+        if not uploader:
+            QMessageBox.warning(self, APP_SECTION, "请填写默认上传者。")
+            self.settings_toggle.setChecked(True)
+            return
+        for t in self.tasks:
+            t.uploader = uploader
+            t.reviewer = reviewer
+            t.clean_meta = clean_meta
+
         worker = UploadWorker(
             credentials_path=self.credentials_path(),
             token_path=self.token_path,
@@ -1137,6 +1336,7 @@ class DriveBatchUploadPage(QWidget):
             tasks=self.tasks,
             copyright_agreed=self.copyright_check.isChecked(),
             skip_existing=self.skip_existing_check.isChecked(),
+            inbound_cols=self.inbound_cols_from_ui(),
         )
         worker.log.connect(self.log)
         worker.failed.connect(self.show_error)

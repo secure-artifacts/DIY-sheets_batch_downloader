@@ -42,11 +42,13 @@ from PySide6.QtWidgets import (
 from sheets_batch_downloader import (
     GoogleClient,
     PublicDownloader,
+    call_with_network_retry,
     default_token_path,
     drive_match_keys,
     extension_from_name,
     extract_drive_file_info,
     extract_drive_folder_id,
+    friendly_network_error,
     is_drive_folder_url,
     parse_title,
     sanitize_path_part,
@@ -231,13 +233,19 @@ class SheetIndexWorker(QThread):
 
     def run(self):
         try:
-            client = GoogleClient(self.credentials_path, self.token_path)
-            sheets = [(i.title, i.row_count) for i in client.list_sheets(self.spreadsheet_id)]
-            index = client.read_name_link_index(
-                self.spreadsheet_id,
-                self.sheet_name,
-                self.name_col,
-                self.link_col,
+            def _load():
+                client = GoogleClient(self.credentials_path, self.token_path)
+                sheets = [(i.title, i.row_count) for i in client.list_sheets(self.spreadsheet_id)]
+                index = client.read_name_link_index(
+                    self.spreadsheet_id,
+                    self.sheet_name,
+                    self.name_col,
+                    self.link_col,
+                )
+                return client, sheets, index
+
+            _client, sheets, index = call_with_network_retry(
+                _load, retries=3, delay=1.2, log=self.log.emit
             )
             with_links = sum(1 for r in index if r.get("url"))
             self.log.emit(
@@ -246,7 +254,7 @@ class SheetIndexWorker(QThread):
             )
             self.loaded.emit(index, sheets)
         except Exception as exc:
-            self.failed.emit(str(exc))
+            self.failed.emit(friendly_network_error(exc))
 
 
 class PasteDownloadWorker(QThread):
@@ -325,7 +333,12 @@ class PasteDownloadWorker(QThread):
         id_index = {}
         output_dir = ""
         try:
-            client = GoogleClient(self.credentials_path, self.token_path)
+            client = call_with_network_retry(
+                lambda: GoogleClient(self.credentials_path, self.token_path),
+                retries=3,
+                delay=1.2,
+                log=self.log.emit,
+            )
             public = PublicDownloader()
             person = str(self.config.get("person_name") or "").strip()
             skip_existing = bool(self.config.get("skip_existing", True))
@@ -980,9 +993,19 @@ class PasteLinkDownloadPage(QWidget):
 
     def _on_fail(self, msg):
         self._pending_start_after_index = False
-        self.log(f"失败：{msg}")
-        QMessageBox.warning(self, APP_SECTION, msg)
-        self.status_row.setText("失败")
+        text = friendly_network_error(msg) if msg else "未知错误"
+        # 多行说明写入日志时压缩成可读几行
+        for line in str(text).splitlines():
+            if line.strip():
+                self.log(f"失败：{line.strip()}")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle(APP_SECTION)
+        box.setText("连接 Google 失败")
+        box.setInformativeText(str(text))
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.exec()
+        self.status_row.setText("网络/权限连接失败，请看日志说明")
         self.set_running(False)
 
     def _on_index_loaded(self, index_rows, sheets):
@@ -1244,24 +1267,29 @@ class _SheetListThenIndexWorker(QThread):
 
     def run(self):
         try:
-            client = GoogleClient(self.credentials_path, self.token_path)
-            sheets = [(i.title, i.row_count) for i in client.list_sheets(self.spreadsheet_id)]
-            if not sheets:
-                raise RuntimeError("表格中没有工作表。")
-            # 优先 combo 当前项
-            preferred = ""
-            try:
-                preferred = self.sheet_combo.currentText().strip()
-            except Exception:
-                pass
-            titles = [t for t, _ in sheets]
-            sheet_name = preferred if preferred in titles else titles[0]
-            self.log.emit(f"使用工作表「{sheet_name}」读取名称列 {self.name_col} / 链接列 {self.link_col}")
-            index = client.read_name_link_index(
-                self.spreadsheet_id, sheet_name, self.name_col, self.link_col
+            def _load():
+                client = GoogleClient(self.credentials_path, self.token_path)
+                sheets = [(i.title, i.row_count) for i in client.list_sheets(self.spreadsheet_id)]
+                if not sheets:
+                    raise RuntimeError("表格中没有工作表。")
+                preferred = ""
+                try:
+                    preferred = self.sheet_combo.currentText().strip()
+                except Exception:
+                    pass
+                titles = [t for t, _ in sheets]
+                sheet_name = preferred if preferred in titles else titles[0]
+                index = client.read_name_link_index(
+                    self.spreadsheet_id, sheet_name, self.name_col, self.link_col
+                )
+                return sheets, sheet_name, index
+
+            sheets, sheet_name, index = call_with_network_retry(
+                _load, retries=3, delay=1.2, log=self.log.emit
             )
+            self.log.emit(f"使用工作表「{sheet_name}」读取名称列 {self.name_col} / 链接列 {self.link_col}")
             with_links = sum(1 for r in index if r.get("url"))
             self.log.emit(f"索引完成：{len(index)} 行，{with_links} 条链接。")
             self.loaded.emit(index, sheets)
         except Exception as exc:
-            self.failed.emit(str(exc))
+            self.failed.emit(friendly_network_error(exc))

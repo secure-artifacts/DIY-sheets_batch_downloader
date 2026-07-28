@@ -27,6 +27,78 @@ def default_token_path() -> str:
     return os.path.join(folder, "token.json")
 
 
+def is_transient_network_error(exc) -> bool:
+    """是否像本机网络/防火墙导致的短暂失败（可重试）。"""
+    msg = str(exc or "").lower()
+    needles = (
+        "connection aborted",
+        "permission denied",
+        "permissionerror",
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "connection reset",
+        "connection refused",
+        "broken pipe",
+        "ssl",
+        "10054",
+        "10060",
+        "10061",
+        "getaddrinfo",
+        "name or service not known",
+        "failed to resolve",
+        "max retries exceeded",
+        "remote end closed",
+    )
+    return any(n in msg for n in needles)
+
+
+def friendly_network_error(exc) -> str:
+    """把 urllib3/Windows 的难懂错误翻成可操作说明。"""
+    raw = str(exc or "")
+    low = raw.lower()
+    if (
+        "connection aborted" in low
+        or "permission denied" in low
+        or "permissionerror" in low
+    ):
+        token = default_token_path()
+        return (
+            "连接 Google 被中断（本机网络/防火墙/代理问题，一般不是表格列填错）。\n"
+            f"技术信息：{raw}\n\n"
+            "请依次尝试：\n"
+            "1. 再点一次「加载工作表」或「开始下载」（已自动重试过仍失败再试）\n"
+            "2. 浏览器能否打开 https://drive.google.com 与 https://sheets.google.com\n"
+            "3. 暂时关闭 VPN/系统代理，或换手机热点试一次\n"
+            "4. 杀毒/防火墙允许 DIY下载器（或 python.exe）访问网络\n"
+            f"5. 仍不行：删除授权缓存后重新登录\n   {token}"
+        )
+    if is_transient_network_error(exc):
+        return f"网络异常：{raw}\n请检查网络后重试。"
+    return raw
+
+
+def call_with_network_retry(fn, *, retries: int = 3, delay: float = 1.2, log=None):
+    """对 Google API 调用做短暂网络重试。"""
+    last_exc = None
+    wait = delay
+    for attempt in range(1, retries + 1):
+        try:
+            return fn()
+        except Exception as exc:
+            last_exc = exc
+            if (not is_transient_network_error(exc)) or attempt >= retries:
+                raise RuntimeError(friendly_network_error(exc)) from exc
+            if log:
+                try:
+                    log(f"网络异常，{wait:.1f}s 后重试（{attempt}/{retries}）：{exc}")
+                except Exception:
+                    pass
+            time.sleep(wait)
+            wait = min(wait * 1.6, 8.0)
+    raise RuntimeError(friendly_network_error(last_exc)) from last_exc
+
+
 def token_has_required_scopes(token_path: str) -> bool:
     """检查 token 是否已具备表格 + Drive 写权限（授权一次即可复用）。"""
     if not os.path.exists(token_path):
