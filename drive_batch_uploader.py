@@ -101,6 +101,50 @@ def build_inbound_values(cells: dict) -> list:
     return [mapped.get(i, "") for i in range(1, max_n + 1)]
 
 
+def is_upload_success_status(status: str) -> bool:
+    st = str(status or "")
+    return st in ("成功", "已存在，跳过") or st.startswith("已存在")
+
+
+def is_retryable_upload_error(exc) -> bool:
+    """空间满/无权限等不可靠重试；网络抖动/5xx/限流可重试。"""
+    msg = str(exc or "").lower()
+    non_retry = (
+        "storagequotaexceeded",
+        "quota has been exceeded",
+        "storage quota",
+        "insufficient authentication scopes",
+        "the caller does not have permission",
+        "forbidden",
+        "file not found",
+        "notfound",
+        "invalid",
+    )
+    if any(x in msg for x in non_retry):
+        return False
+    retry = (
+        "connection",
+        "timeout",
+        "timed out",
+        "aborted",
+        "reset",
+        "ssl",
+        "503",
+        "500",
+        "502",
+        "429",
+        "rate limit",
+        "ratelimit",
+        "backend error",
+        "internal error",
+        "temporarily",
+        "unavailable",
+        "broken pipe",
+        "max retries",
+    )
+    return any(x in msg for x in retry)
+
+
 @dataclass
 class UploadFileItem:
     path: str
@@ -137,6 +181,76 @@ def settings_path() -> str:
     folder = os.path.join(base, "DIYDownloader")
     os.makedirs(folder, exist_ok=True)
     return os.path.join(folder, "upload_settings.json")
+
+
+def task_queue_path() -> str:
+    """上传任务清单持久化路径（重启可恢复失败项）。"""
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    folder = os.path.join(base, "DIYDownloader")
+    os.makedirs(folder, exist_ok=True)
+    return os.path.join(folder, "upload_task_queue.json")
+
+
+def task_to_dict(task: UploadTask) -> dict:
+    return {
+        "index": task.index,
+        "is_image_mode": bool(task.is_image_mode),
+        "cat1": task.cat1,
+        "cat2": task.cat2,
+        "cat3": task.cat3,
+        "video_type": task.video_type,
+        "uploader": task.uploader,
+        "reviewer": task.reviewer,
+        "clean_meta": task.clean_meta,
+        "folder_url": task.folder_url,
+        "status": task.status,
+        "source_folder": task.source_folder,
+        "files": [
+            {
+                "path": f.path,
+                "name": f.name,
+                "status": f.status,
+                "file_url": f.file_url,
+            }
+            for f in task.files
+        ],
+    }
+
+
+def task_from_dict(data: dict) -> UploadTask | None:
+    if not isinstance(data, dict):
+        return None
+    files = []
+    for fd in data.get("files") or []:
+        if not isinstance(fd, dict):
+            continue
+        path = str(fd.get("path") or "")
+        name = str(fd.get("name") or os.path.basename(path) or "file")
+        files.append(
+            UploadFileItem(
+                path=path,
+                name=name,
+                status=str(fd.get("status") or "待上传"),
+                file_url=str(fd.get("file_url") or ""),
+            )
+        )
+    if not files:
+        return None
+    return UploadTask(
+        index=int(data.get("index") or 0),
+        is_image_mode=bool(data.get("is_image_mode")),
+        cat1=str(data.get("cat1") or ""),
+        cat2=str(data.get("cat2") or ""),
+        cat3=str(data.get("cat3") or ""),
+        video_type=str(data.get("video_type") or ""),
+        uploader=str(data.get("uploader") or ""),
+        reviewer=str(data.get("reviewer") or ""),
+        clean_meta=str(data.get("clean_meta") or ""),
+        files=files,
+        folder_url=str(data.get("folder_url") or ""),
+        status=str(data.get("status") or "待处理"),
+        source_folder=str(data.get("source_folder") or ""),
+    )
 
 
 def default_credentials_path() -> str:
@@ -296,6 +410,8 @@ class UploadWorker(QThread):
         copyright_agreed: bool,
         skip_existing: bool,
         inbound_cols: dict | None = None,
+        only_failed: bool = False,
+        max_retries: int = 3,
     ):
         super().__init__()
         self.credentials_path = credentials_path
@@ -307,6 +423,8 @@ class UploadWorker(QThread):
         self.tasks = tasks
         self.copyright_agreed = copyright_agreed
         self.skip_existing = skip_existing
+        self.only_failed = only_failed
+        self.max_retries = max(1, int(max_retries or 1))
         cols = dict(DEFAULT_INBOUND_COLS)
         if inbound_cols:
             cols.update({k: normalize_col(v, cols.get(k, "A")) for k, v in inbound_cols.items() if k in cols})
@@ -316,13 +434,42 @@ class UploadWorker(QThread):
     def stop(self):
         self.stop_event.set()
 
+    def _upload_one_file(self, client: GoogleClient, folder_id: str, file_item: UploadFileItem):
+        existing = client.find_file_in_folder(folder_id, file_item.name)
+        if existing and self.skip_existing:
+            return "skipped", existing.get("webViewLink") or ""
+        if existing and not self.skip_existing:
+            created = existing
+        else:
+            created = client.upload_local_file(
+                file_item.path,
+                folder_id,
+                file_name=file_item.name,
+                mime_type=guess_mime(file_item.path),
+            )
+        return "ok", created.get("webViewLink") or ""
+
     def run(self):
         success = failed = skipped = 0
-        total_files = sum(len(t.files) for t in self.tasks)
+        pending_files = []
+        for t in self.tasks:
+            for fi, f in enumerate(t.files):
+                if self.only_failed and is_upload_success_status(f.status):
+                    continue
+                pending_files.append((t, fi, f))
+        total_files = len(pending_files) if self.only_failed else sum(len(t.files) for t in self.tasks)
+        if total_files == 0:
+            self.log.emit("没有需要上传的文件（失败重试时若全成功会提示此项）。")
+            self.done.emit()
+            return
         done_files = 0
         try:
             client = GoogleClient(self.credentials_path, self.token_path)
-            self.log.emit(f"已使用凭据：{client.account_label}")
+            self.log.emit(
+                f"已使用凭据：{client.account_label}；"
+                f"{'仅失败重试' if self.only_failed else '全量上传'}；"
+                f"单文件最多自动重试 {self.max_retries} 次"
+            )
             if not self.parent_folder_id.strip():
                 raise RuntimeError("请填写 Google Drive 父文件夹 ID")
             if not self.spreadsheet_id.strip():
@@ -332,6 +479,17 @@ class UploadWorker(QThread):
                 if self.stop_event.is_set():
                     self.log.emit("任务已停止。")
                     break
+
+                # 仅失败重试：任务内若无待处理文件则跳过
+                task_files = list(enumerate(task.files))
+                if self.only_failed:
+                    task_files = [
+                        (fi, f) for fi, f in task_files
+                        if not is_upload_success_status(f.status)
+                    ]
+                    if not task_files:
+                        continue
+
                 self.task_update.emit(task.index, "上传中", "")
                 date_str = datetime.now().strftime("%Y-%m-%d")
                 if task.is_image_mode:
@@ -339,67 +497,95 @@ class UploadWorker(QThread):
                 else:
                     path_parts = [task.cat1, task.cat2, task.cat3, date_str, task.uploader]
 
-                try:
-                    folder_meta = client.get_or_create_folder_path(self.parent_folder_id, path_parts)
-                    folder_id = folder_meta["id"]
-                    folder_url = folder_meta.get("webViewLink") or f"https://drive.google.com/drive/folders/{folder_id}"
-                    task.folder_url = folder_url
-                    path_label = "/".join([p for p in path_parts if p])
-                    self.log.emit(f"任务#{task.index} 目标目录：{path_label}")
-                except Exception as exc:
-                    self.task_update.emit(task.index, f"失败：{exc}", "")
-                    self.log.emit(f"任务#{task.index} 创建目录失败：{exc}")
-                    failed += len(task.files)
-                    done_files += len(task.files)
-                    self.progress.emit(done_files, total_files)
+                folder_id = ""
+                path_label = ""
+                folder_ok = False
+                for attempt in range(1, self.max_retries + 1):
+                    if self.stop_event.is_set():
+                        break
+                    try:
+                        folder_meta = client.get_or_create_folder_path(self.parent_folder_id, path_parts)
+                        folder_id = folder_meta["id"]
+                        folder_url = folder_meta.get("webViewLink") or f"https://drive.google.com/drive/folders/{folder_id}"
+                        task.folder_url = folder_url
+                        path_label = "/".join([p for p in path_parts if p])
+                        self.log.emit(f"任务#{task.index} 目标目录：{path_label}")
+                        folder_ok = True
+                        break
+                    except Exception as exc:
+                        if is_retryable_upload_error(exc) and attempt < self.max_retries:
+                            self.log.emit(
+                                f"任务#{task.index} 创建目录失败，{attempt}/{self.max_retries} 次，稍后重试：{exc}"
+                            )
+                            time.sleep(min(1.5 * attempt, 6.0))
+                            continue
+                        self.task_update.emit(task.index, f"失败：{exc}", "")
+                        self.log.emit(f"任务#{task.index} 创建目录失败：{exc}")
+                        failed += len(task_files)
+                        done_files += len(task_files)
+                        self.progress.emit(done_files, total_files)
+                        break
+                if not folder_ok:
                     continue
 
-                for fi, file_item in enumerate(task.files):
+                for fi, file_item in task_files:
                     if self.stop_event.is_set():
                         break
                     self.item_update.emit(task.index, fi, "上传中", "")
-                    try:
-                        existing = client.find_file_in_folder(folder_id, file_item.name)
-                        if existing and self.skip_existing:
-                            file_url = existing.get("webViewLink") or ""
-                            self.item_update.emit(task.index, fi, "已存在，跳过", file_url)
-                            skipped += 1
-                            done_files += 1
-                            self.progress.emit(done_files, total_files)
-                            self._write_inbound(client, task, file_url)
-                            continue
-                        if existing and not self.skip_existing:
-                            created = existing
-                        else:
-                            created = client.upload_local_file(
-                                file_item.path,
-                                folder_id,
-                                file_name=file_item.name,
-                                mime_type=guess_mime(file_item.path),
-                            )
-                        file_url = created.get("webViewLink") or ""
-                        self._write_inbound(client, task, file_url)
-                        try:
-                            client.append_upload_log(
-                                self.spreadsheet_id, self.log_sheet, "INFO",
-                                f"文件 [{file_item.name}] 上传成功，路径: {path_label}",
-                            )
-                        except Exception as log_exc:
-                            self.log.emit(f"写上传日志失败：{log_exc}")
-                        self.item_update.emit(task.index, fi, "成功", file_url)
-                        success += 1
-                        done_files += 1
-                        self.progress.emit(done_files, total_files)
-                        self.log.emit(f"成功：{file_item.name}")
-                    except Exception as exc:
+                    last_exc = None
+                    uploaded = False
+                    for attempt in range(1, self.max_retries + 1):
                         if self.stop_event.is_set():
-                            self.item_update.emit(task.index, fi, "已停止", "")
                             break
+                        try:
+                            kind, file_url = self._upload_one_file(client, folder_id, file_item)
+                            if kind == "skipped":
+                                self.item_update.emit(task.index, fi, "已存在，跳过", file_url)
+                                skipped += 1
+                                self._write_inbound(client, task, file_url)
+                            else:
+                                self._write_inbound(client, task, file_url)
+                                try:
+                                    client.append_upload_log(
+                                        self.spreadsheet_id, self.log_sheet, "INFO",
+                                        f"文件 [{file_item.name}] 上传成功，路径: {path_label}",
+                                    )
+                                except Exception as log_exc:
+                                    self.log.emit(f"写上传日志失败：{log_exc}")
+                                self.item_update.emit(task.index, fi, "成功", file_url)
+                                success += 1
+                                self.log.emit(f"成功：{file_item.name}" + (f"（第 {attempt} 次）" if attempt > 1 else ""))
+                            uploaded = True
+                            break
+                        except Exception as exc:
+                            last_exc = exc
+                            if self.stop_event.is_set():
+                                self.item_update.emit(task.index, fi, "已停止", "")
+                                break
+                            if is_retryable_upload_error(exc) and attempt < self.max_retries:
+                                wait = min(1.5 * attempt, 8.0)
+                                self.log.emit(
+                                    f"失败将重试 {attempt}/{self.max_retries}：{file_item.name} -> {exc}；{wait:.1f}s 后重试"
+                                )
+                                self.item_update.emit(
+                                    task.index, fi, f"重试中 {attempt}/{self.max_retries}", ""
+                                )
+                                time.sleep(wait)
+                                continue
+                            break
+
+                    if not uploaded and not self.stop_event.is_set():
                         failed += 1
-                        done_files += 1
-                        self.progress.emit(done_files, total_files)
-                        self.item_update.emit(task.index, fi, f"失败：{exc}", "")
-                        self.log.emit(f"失败：{file_item.name} -> {exc}")
+                        msg = str(last_exc or "未知错误")
+                        self.item_update.emit(task.index, fi, f"失败：{msg}", "")
+                        self.log.emit(f"失败：{file_item.name} -> {msg}")
+                        # 空间满时提示，避免傻重试整批
+                        low = msg.lower()
+                        if "storagequotaexceeded" in low or "quota has been exceeded" in low:
+                            self.log.emit("提示：云端盘空间已满，请清理空间后再点「重试失败项」。")
+
+                    done_files += 1
+                    self.progress.emit(done_files, total_files)
 
                 self.task_update.emit(task.index, "完成", task.folder_url)
 
@@ -457,6 +643,7 @@ class DriveBatchUploadPage(QWidget):
         self.build_ui()
         self.connect_signals()
         self.load_saved_settings()
+        self.load_task_queue()
 
     def credentials_path(self) -> str:
         if callable(self.credentials_supplier):
@@ -721,12 +908,27 @@ class DriveBatchUploadPage(QWidget):
         self.add_task_btn.setObjectName("primaryButton")
         self.start_btn = QPushButton("开始批量上传")
         self.start_btn.setObjectName("primaryButton")
+        self.retry_failed_btn = QPushButton("重试失败项")
+        self.retry_failed_btn.setObjectName("secondaryButton")
+        self.retry_failed_btn.setToolTip(
+            "只重新上传失败/未完成文件。清单会保存到本机，下次启动软件仍可继续重试。"
+        )
+        self.clear_done_btn = QPushButton("清除已完成")
+        self.clear_done_btn.setObjectName("secondaryButton")
+        self.clear_done_btn.setToolTip("从清单移除已成功/已跳过的文件，只保留失败与待上传项，便于下次继续。")
         self.stop_btn = QPushButton("停止")
         self.stop_btn.setObjectName("dangerButton")
         self.stop_btn.setEnabled(False)
         self.clear_tasks_btn = QPushButton("清空清单")
         self.clear_tasks_btn.setObjectName("ghostButton")
-        for b in (self.add_task_btn, self.start_btn, self.stop_btn, self.clear_tasks_btn):
+        for b in (
+            self.add_task_btn,
+            self.start_btn,
+            self.retry_failed_btn,
+            self.clear_done_btn,
+            self.stop_btn,
+            self.clear_tasks_btn,
+        ):
             work.layout.addWidget(b)
 
         left.addStretch(1)
@@ -821,6 +1023,8 @@ class DriveBatchUploadPage(QWidget):
         self.pick_folder_btn.clicked.connect(self.pick_category_folder)
         self.add_task_btn.clicked.connect(self.add_task)
         self.start_btn.clicked.connect(self.start_upload)
+        self.retry_failed_btn.clicked.connect(self.retry_failed_uploads)
+        self.clear_done_btn.clicked.connect(self.clear_completed_tasks)
         self.stop_btn.clicked.connect(self.stop_upload)
         self.clear_tasks_btn.clicked.connect(self.clear_tasks)
         self.copy_receipt_btn.clicked.connect(self.copy_receipts)
@@ -1234,10 +1438,114 @@ class DriveBatchUploadPage(QWidget):
     def clear_tasks(self):
         if self.has_running_worker():
             return
+        if self.tasks:
+            reply = QMessageBox.question(
+                self,
+                APP_SECTION,
+                "确定清空全部上传清单吗？\n（本机已保存的失败记录也会一并删除）",
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
         self.tasks = []
+        self.task_seq = 0
         self.rebuild_table()
+        self.save_task_queue()
         self.progress_bar.setValue(0)
         self.progress_label.setText("等待开始")
+        self.log("已清空上传清单。")
+
+    def clear_completed_tasks(self):
+        """清除已成功/已跳过，只保留失败与待上传，方便下次继续。"""
+        if self.has_running_worker():
+            return
+        before_files = sum(len(t.files) for t in self.tasks)
+        kept_tasks = []
+        removed = 0
+        for task in self.tasks:
+            remain = [f for f in task.files if not is_upload_success_status(f.status)]
+            removed += len(task.files) - len(remain)
+            if remain:
+                task.files = remain
+                # 任务状态：若还有失败则标待重试
+                if any(str(f.status or "").startswith("失败") or f.status in ("已停止", "待上传") for f in remain):
+                    task.status = "待重试"
+                kept_tasks.append(task)
+        self.tasks = kept_tasks
+        self.rebuild_table()
+        self.save_task_queue()
+        self.log(f"已清除完成项 {removed} 个文件，保留 {sum(len(t.files) for t in self.tasks)} 个待处理/失败。")
+        self.status_row.setText(
+            f"已清除完成 {removed}，剩余 {sum(len(t.files) for t in self.tasks)} 文件待处理"
+        )
+        if before_files and removed == 0:
+            QMessageBox.information(self, APP_SECTION, "当前没有「已完成」的文件可清除。")
+
+    def save_task_queue(self):
+        """把当前清单写到本机，重启软件可恢复。"""
+        path = task_queue_path()
+        payload = {
+            "version": 1,
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "task_seq": self.task_seq,
+            "tasks": [task_to_dict(t) for t in self.tasks],
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            self.log(f"保存上传清单失败：{exc}")
+
+    def load_task_queue(self):
+        """启动时恢复上次未完成/失败的上传清单。"""
+        path = task_queue_path()
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as exc:
+            self.log(f"读取上传清单失败：{exc}")
+            return
+        raw_tasks = data.get("tasks") or []
+        restored = []
+        missing = 0
+        for item in raw_tasks:
+            task = task_from_dict(item)
+            if not task:
+                continue
+            # 丢弃本地已不存在的文件
+            keep_files = []
+            for fi in task.files:
+                if is_upload_success_status(fi.status):
+                    keep_files.append(fi)  # 成功也先恢复，用户可点「清除已完成」
+                elif fi.path and os.path.isfile(fi.path):
+                    keep_files.append(fi)
+                else:
+                    missing += 1
+            if not keep_files:
+                continue
+            task.files = keep_files
+            restored.append(task)
+        if not restored:
+            return
+        self.tasks = restored
+        self.task_seq = max(
+            int(data.get("task_seq") or 0),
+            max((t.index for t in restored), default=0),
+        )
+        failed_n = sum(
+            1 for t in self.tasks for f in t.files if not is_upload_success_status(f.status)
+        )
+        done_n = sum(1 for t in self.tasks for f in t.files if is_upload_success_status(f.status))
+        self.rebuild_table()
+        self.log(
+            f"已恢复上次上传清单：{len(self.tasks)} 任务，"
+            f"完成 {done_n}，未完成/失败 {failed_n}"
+            + (f"，丢失本地文件 {missing}" if missing else "")
+            + f"。\n保存位置：{path}"
+        )
+        if failed_n:
+            self.status_row.setText(f"已恢复清单 · 可点「清除已完成」后「重试失败项」（{failed_n} 个）")
 
     def rebuild_table(self):
         rows = []
@@ -1262,10 +1570,18 @@ class DriveBatchUploadPage(QWidget):
                     elif "跳过" in st:
                         cell.setForeground(QColor("#fbbf24"))
                 self.table.setItem(i, col, cell)
+        failed_n = sum(
+            1 for t in self.tasks for f in t.files if not is_upload_success_status(f.status)
+        )
+        done_n = sum(1 for t in self.tasks for f in t.files if is_upload_success_status(f.status))
+        total = sum(len(t.files) for t in self.tasks)
         self.status_row.setText(
-            f"清单 {len(self.tasks)} 任务 / {sum(len(t.files) for t in self.tasks)} 文件"
+            f"清单 {len(self.tasks)} 任务 / {total} 文件（完成 {done_n} · 待处理/失败 {failed_n}）· 已自动保存"
         )
         self.refresh_receipt_box()
+        # 状态变化时落盘（上传中也会刷新）
+        if not self.has_running_worker():
+            self.save_task_queue()
 
     def refresh_receipt_box(self):
         lines = []
@@ -1292,6 +1608,25 @@ class DriveBatchUploadPage(QWidget):
         self.log("回执已复制。")
 
     def start_upload(self):
+        self._start_upload_worker(only_failed=False)
+
+    def retry_failed_uploads(self):
+        """只重试失败/停止的文件。"""
+        if self.has_running_worker():
+            return
+        n = sum(
+            1
+            for t in self.tasks
+            for f in t.files
+            if not is_upload_success_status(f.status)
+        )
+        if n == 0:
+            QMessageBox.information(self, APP_SECTION, "当前没有失败项可重试。")
+            return
+        self.log(f"准备重试 {n} 个未成功文件…")
+        self._start_upload_worker(only_failed=True)
+
+    def _start_upload_worker(self, only_failed: bool = False):
         if self.has_running_worker():
             return
         if not self.tasks:
@@ -1310,10 +1645,6 @@ class DriveBatchUploadPage(QWidget):
             self.settings_toggle.setChecked(True)
             return
 
-        self.set_running(True)
-        self.progress_bar.setValue(0)
-        self.progress_label.setText("上传中…")
-        # 任务上刷新最新的上传者/审核/元数据设置（加入清单后若改了设置也生效）
         uploader = self.uploader_edit.text().strip()
         reviewer = self.reviewer_edit.text().strip()
         clean_meta = self.clean_meta_text()
@@ -1326,6 +1657,10 @@ class DriveBatchUploadPage(QWidget):
             t.reviewer = reviewer
             t.clean_meta = clean_meta
 
+        self.set_running(True)
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("重试失败项…" if only_failed else "上传中…")
+
         worker = UploadWorker(
             credentials_path=self.credentials_path(),
             token_path=self.token_path,
@@ -1337,6 +1672,8 @@ class DriveBatchUploadPage(QWidget):
             copyright_agreed=self.copyright_check.isChecked(),
             skip_existing=self.skip_existing_check.isChecked(),
             inbound_cols=self.inbound_cols_from_ui(),
+            only_failed=only_failed,
+            max_retries=3,
         )
         worker.log.connect(self.log)
         worker.failed.connect(self.show_error)
@@ -1362,6 +1699,8 @@ class DriveBatchUploadPage(QWidget):
                     task.files[file_index].file_url = file_url
                 break
         self.rebuild_table()
+        # 上传过程中也定期落盘，避免中途崩溃丢失败记录
+        self.save_task_queue()
 
     def on_task_update(self, task_index, status, folder_url):
         for task in self.tasks:
@@ -1371,6 +1710,7 @@ class DriveBatchUploadPage(QWidget):
                     task.folder_url = folder_url
                 break
         self.rebuild_table()
+        self.save_task_queue()
 
     def on_progress(self, done, total):
         pct = int(done * 100 / total) if total else 0
@@ -1380,17 +1720,32 @@ class DriveBatchUploadPage(QWidget):
     def on_upload_done(self):
         self.progress_label.setText("上传完成")
         self.refresh_receipt_box()
-        self.log("上传流程结束。")
+        self.save_task_queue()
+        failed_n = sum(
+            1 for t in self.tasks for f in t.files if not is_upload_success_status(f.status)
+        )
+        if failed_n:
+            self.log(
+                f"上传流程结束。仍有 {failed_n} 个未成功，清单已保存到本机；"
+                f"下次启动可继续，或点「清除已完成」后「重试失败项」。\n"
+                f"清单文件：{task_queue_path()}"
+            )
+        else:
+            self.log("上传流程结束。全部成功；可点「清除已完成」整理清单。")
 
     def on_worker_finished(self):
         if self.sender() is self.worker:
             self.worker = None
         self.set_running(False)
+        self.save_task_queue()
 
     def set_running(self, running: bool):
         self.start_btn.setEnabled(not running)
+        self.retry_failed_btn.setEnabled(not running)
+        self.clear_done_btn.setEnabled(not running)
         self.add_task_btn.setEnabled(not running)
         self.load_cat_btn.setEnabled(not running)
+        self.clear_tasks_btn.setEnabled(not running)
         self.stop_btn.setEnabled(running)
 
     def open_parent_folder(self):
