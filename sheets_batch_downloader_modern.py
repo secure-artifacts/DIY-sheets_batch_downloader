@@ -51,8 +51,8 @@ from sheets_batch_downloader import (
     unique_path,
 )
 from video_batch_downloader import VideoBatchPage
-from drive_batch_uploader import DriveBatchUploadPage
-from paste_link_download_page import PasteLinkDownloadPage
+from drive_batch_uploader import DriveBatchUploadPage, settings_path as upload_settings_path, task_queue_path
+from paste_link_download_page import PasteLinkDownloadPage, settings_path as paste_settings_path
 from version import APP_NAME, APP_VERSION, RELEASES_PAGE
 from updater import (
     check_for_update,
@@ -1370,6 +1370,14 @@ class MainWindow(QMainWindow):
             QDialog QPushButton#secondaryButton:hover, QDialog QPushButton#ghostButton:hover {{
                 border-color: {c["accent2"]};
             }}
+            QDialog QPushButton#dangerButton {{
+                background-color: {c["danger"]};
+                color: #fee2e2;
+                border: 1px solid {c["danger_border"]};
+            }}
+            QDialog QPushButton#dangerButton:hover {{
+                background-color: #b91c1c;
+            }}
             QDialog QDialogButtonBox QPushButton {{
                 background-color: {c["accent"]};
                 color: #ffffff;
@@ -1596,6 +1604,101 @@ class MainWindow(QMainWindow):
         card_lay.addWidget(token_label)
         lay.addWidget(card)
 
+        # ----- 清理 / 重新授权 -----
+        maint = QFrame()
+        maint.setObjectName("compactPanel")
+        mlay = QVBoxLayout(maint)
+        mlay.setContentsMargins(16, 14, 16, 14)
+        mlay.setSpacing(10)
+        mtitle = QLabel("维护 · 清理配置 / 重新授权")
+        mtitle.setObjectName("cardTitle")
+        mlay.addWidget(mtitle)
+        mtip = QLabel(
+            "权限不足、换账号、或配置错乱时使用。清理授权后，下次访问 Google 会重新打开浏览器登录。"
+        )
+        mtip.setObjectName("subtitle")
+        mtip.setWordWrap(True)
+        mlay.addWidget(mtip)
+
+        reauth_btn = QPushButton("清除授权并重新登录…")
+        reauth_btn.setObjectName("dangerButton")
+        reauth_btn.setToolTip("删除本机 token.json，下次使用 Google 功能时会弹出浏览器重新授权")
+        clean_btn = QPushButton("清理配置文件…")
+        clean_btn.setObjectName("secondaryButton")
+        clean_btn.setToolTip("可选清理全局/上传/粘贴设置、上传失败清单、下载方案等（不会删你的凭据 JSON 源文件）")
+        open_dir_btn = QPushButton("打开本机配置目录")
+        open_dir_btn.setObjectName("ghostButton")
+
+        def refresh_token_label():
+            tok = getattr(self, "token_file_path", default_token_path())
+            ok = os.path.exists(tok)
+            token_label.setText(
+                f"授权缓存：{tok}\n"
+                + ("状态：已有 token，一般无需重新登录" if ok else "状态：尚未授权，下次使用将打开浏览器登录")
+            )
+
+        def do_reauth():
+            box = QMessageBox(dlg)
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle("清除授权")
+            box.setText(
+                "将删除本机 Google 授权缓存（token），下次使用表格/上传/下载时会重新登录。\n\n"
+                "不会删除你选择的凭据 JSON 文件本身。\n\n确定继续？"
+            )
+            box.setStandardButtons(
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            box.setStyleSheet(self.dialog_stylesheet())
+            if box.exec() != QMessageBox.StandardButton.Yes:
+                return
+            removed, errors = self.clear_google_auth()
+            refresh_token_label()
+            self._notify_shared_credentials()
+            if errors:
+                self.log("清除授权部分失败：" + "；".join(errors))
+            self.log("已清除授权：" + ("、".join(removed) if removed else "（本无 token 文件）"))
+            # 立即触发一次连接以打开浏览器重新授权
+            cred = path_edit.text().strip() or self.credentials_edit.text().strip()
+            if cred and os.path.exists(cred):
+                try:
+                    from sheets_batch_downloader import GoogleClient
+                    GoogleClient(cred, self.token_file_path)
+                    refresh_token_label()
+                    self.log("已重新完成浏览器授权。")
+                    QMessageBox.information(
+                        dlg, "全局设置",
+                        "授权缓存已清除，并已重新完成登录。\n可关闭本窗口继续使用。",
+                    )
+                except Exception as exc:
+                    self.log(f"重新授权未完成（可稍后在任意功能中自动弹出登录）：{exc}")
+                    QMessageBox.information(
+                        dlg, "全局设置",
+                        "授权缓存已清除。\n下次使用「加载工作表 / 上传 / 粘贴下载」时会自动打开浏览器登录。",
+                    )
+            else:
+                QMessageBox.information(
+                    dlg, "全局设置",
+                    "授权缓存已清除。请先保存正确的凭据 JSON，再使用各功能触发重新登录。",
+                )
+
+        def do_clean_configs():
+            self.open_clean_config_dialog(parent=dlg)
+            refresh_token_label()
+
+        def open_cfg_dir():
+            base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+            folder = os.path.join(base, "DIYDownloader")
+            os.makedirs(folder, exist_ok=True)
+            QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+
+        reauth_btn.clicked.connect(do_reauth)
+        clean_btn.clicked.connect(do_clean_configs)
+        open_dir_btn.clicked.connect(open_cfg_dir)
+        mlay.addWidget(reauth_btn)
+        mlay.addWidget(clean_btn)
+        mlay.addWidget(open_dir_btn)
+        lay.addWidget(maint)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
@@ -1639,6 +1742,168 @@ class MainWindow(QMainWindow):
         buttons.rejected.connect(dlg.reject)
         dlg.exec()
 
+    def app_data_dir(self) -> str:
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        folder = os.path.join(base, "DIYDownloader")
+        os.makedirs(folder, exist_ok=True)
+        return folder
+
+    def clear_google_auth(self) -> tuple[list, list]:
+        """删除 token 授权缓存。返回 (已删除路径列表, 错误列表)。"""
+        removed, errors = [], []
+        candidates = [
+            getattr(self, "token_file_path", "") or default_token_path(),
+            default_token_path(),
+            os.path.join(app_base_dir(), "token.json"),
+        ]
+        try:
+            candidates.append(os.path.join(bundle_base_dir(), "token.json"))
+        except Exception:
+            pass
+        seen = set()
+        paths = []
+        for p in candidates:
+            if not p:
+                continue
+            try:
+                p = os.path.abspath(p)
+            except Exception:
+                continue
+            if p not in seen:
+                seen.add(p)
+                paths.append(p)
+        for p in paths:
+            if not os.path.exists(p):
+                continue
+            try:
+                os.remove(p)
+                removed.append(p)
+            except Exception as exc:
+                errors.append(f"{p}: {exc}")
+        return removed, errors
+
+    def open_clean_config_dialog(self, parent=None):
+        """可选清理各类本机配置文件。"""
+        parent = parent or self
+        colors = self.theme_colors()
+        dlg = QDialog(parent)
+        dlg.setWindowTitle("清理配置文件")
+        dlg.setMinimumWidth(520)
+        dlg.setStyleSheet(self.dialog_stylesheet())
+        self._fill_widget_bg(dlg, colors["dialog_bg"])
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(18, 16, 18, 16)
+        lay.setSpacing(10)
+
+        title = QLabel("选择要清理的项目")
+        title.setObjectName("cardTitle")
+        lay.addWidget(title)
+        tip = QLabel(
+            "默认只清授权与业务配置，不会删除你的凭据 JSON 源文件，也不会删除 ffmpeg 工具目录。\n"
+            "清理后相关功能需重新填写设置；清授权后需重新浏览器登录。"
+        )
+        tip.setObjectName("subtitle")
+        tip.setWordWrap(True)
+        lay.addWidget(tip)
+
+        token_path = getattr(self, "token_file_path", default_token_path())
+        legacy_token = os.path.join(app_base_dir(), "token.json")
+        config_path = getattr(self, "config_file_path", os.path.join(app_base_dir(), "diy_downloader_configs.json"))
+
+        options = [
+            ("auth", True, "Google 授权缓存 token.json（重新授权）", [token_path, legacy_token]),
+            ("global", False, "全局设置 global_settings.json（凭据路径记忆）", [self.global_settings_file()]),
+            ("upload_cfg", False, "上传页设置 upload_settings.json", [upload_settings_path()]),
+            ("upload_queue", False, "上传失败清单 upload_task_queue.json", [task_queue_path()]),
+            ("paste_cfg", False, "粘贴链接设置 paste_link_settings.json", [paste_settings_path()]),
+            ("download_cfg", False, "表格下载方案 diy_downloader_configs.json", [config_path]),
+        ]
+
+        checks = {}
+        for key, checked, label, _paths in options:
+            cb = QCheckBox(label)
+            cb.setChecked(checked)
+            lay.addWidget(cb)
+            checks[key] = (cb, _paths)
+
+        btn_row = QHBoxLayout()
+        ok_btn = QPushButton("确认清理")
+        ok_btn.setObjectName("dangerButton")
+        cancel_btn = QPushButton("取消")
+        cancel_btn.setObjectName("secondaryButton")
+        btn_row.addStretch(1)
+        btn_row.addWidget(ok_btn)
+        btn_row.addWidget(cancel_btn)
+        lay.addLayout(btn_row)
+
+        def on_ok():
+            selected = []
+            for key, (cb, paths) in checks.items():
+                if cb.isChecked():
+                    selected.append((key, paths))
+            if not selected:
+                QMessageBox.information(dlg, "清理配置", "请至少勾选一项。")
+                return
+            names = "\n".join(f"· {checks[k][0].text()}" for k, _ in selected)
+            confirm = QMessageBox(dlg)
+            confirm.setIcon(QMessageBox.Icon.Warning)
+            confirm.setWindowTitle("确认清理")
+            confirm.setText(f"将删除下列配置：\n\n{names}\n\n确定吗？")
+            confirm.setStandardButtons(
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            confirm.setStyleSheet(self.dialog_stylesheet())
+            if confirm.exec() != QMessageBox.StandardButton.Yes:
+                return
+
+            removed, errors = [], []
+            for key, paths in selected:
+                for p in paths:
+                    if not p or not os.path.exists(p):
+                        continue
+                    try:
+                        os.remove(p)
+                        removed.append(p)
+                    except Exception as exc:
+                        errors.append(f"{p}: {exc}")
+
+            # 内存侧同步
+            if any(k == "auth" for k, _ in selected):
+                self._notify_shared_credentials()
+            if any(k == "global" for k, _ in selected):
+                # 凭据路径回退默认
+                self.credentials_edit.setText(default_credentials_path())
+            if any(k == "upload_queue" for k, _ in selected) and hasattr(self, "upload_page"):
+                try:
+                    self.upload_page.tasks = []
+                    self.upload_page.task_seq = 0
+                    if hasattr(self.upload_page, "rebuild_table"):
+                        self.upload_page.rebuild_table()
+                except Exception:
+                    pass
+            if any(k == "download_cfg" for k, _ in selected):
+                try:
+                    self.configs = {}
+                    self.refresh_config_combo()
+                except Exception:
+                    pass
+
+            msg = []
+            if removed:
+                msg.append("已删除：\n" + "\n".join(removed))
+                self.log("已清理配置：\n" + "\n".join(removed))
+            else:
+                msg.append("没有找到可删除的文件（可能本来就不存在）。")
+            if errors:
+                msg.append("失败：\n" + "\n".join(errors))
+                self.log("清理配置失败：" + "；".join(errors))
+            QMessageBox.information(dlg, "清理配置", "\n\n".join(msg))
+            dlg.accept()
+
+        ok_btn.clicked.connect(on_ok)
+        cancel_btn.clicked.connect(dlg.reject)
+        dlg.exec()
+
     def choose_credentials(self):
         """兼容旧入口：打开全局设置。"""
         self.open_global_settings()
@@ -1663,7 +1928,8 @@ class MainWindow(QMainWindow):
             "使用步骤：\n"
             "【全局设置】（标题栏「暗黑模式」左侧）\n"
             "1. 点「⚙ 全局设置」选择 Google 凭据 JSON（各功能共用）。\n"
-            "2. 授权 token 保存在本机，授权一次后表格下载与云端上传可共用。\n\n"
+            "2. 授权 token 保存在本机，授权一次后各功能共用。\n"
+            "3. 权限异常/换账号：用「清除授权并重新登录」；可「清理配置文件」勾选要删的本地设置。\n\n"
             "【表格下载】\n"
             "1. 全局设置选好凭据；本页配置下载目录与表格列，整列扫描链接下载。\n"
             "2. 适合按表格链接列批量下载。\n\n"
