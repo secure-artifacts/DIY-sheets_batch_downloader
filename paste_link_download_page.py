@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -35,6 +36,7 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -705,30 +707,69 @@ class PasteLinkDownloadPage(QWidget):
         self._left_scroll = left_scroll
         self._left_inner = left_inner
 
-        cfg = Card("表格与列配置", "settingsCard")
-        left.addWidget(cfg)
-        g = cfg.layout
+        # ----- 常驻设置卡片（常驻显示，设置折叠后依然可见） -----
+        main_cfg = Card("常用设置", "workCard")
+        left.addWidget(main_cfg)
+        mg = main_cfg.layout
+
+        self.person_name_edit = QLineEdit()
+        self.person_name_edit.setPlaceholderText("下载人员姓名（写入表格人员列）")
+
+        self.output_edit = QLineEdit(os.path.join(os.path.expanduser("~"), "Downloads", "粘贴链接下载"))
+
+        c_person = QLabel("下载人员姓名")
+        c_person.setObjectName("fieldLabel")
+        mg.addWidget(c_person)
+        mg.addWidget(self.person_name_edit)
+
+        c_out = QLabel("下载目录（保存路径）")
+        c_out.setObjectName("fieldLabel")
+        mg.addWidget(c_out)
+        out_row = QHBoxLayout()
+        out_row.addWidget(self.output_edit, 1)
+        pick_out = QPushButton("选择目录")
+        pick_out.setObjectName("secondaryButton")
+        pick_out.clicked.connect(self.choose_output)
+        out_row.addWidget(pick_out)
+        mg.addLayout(out_row)
+
+        # ----- 可折叠高级/表格设置 -----
+        self.settings_toggle = QToolButton()
+        self.settings_toggle.setObjectName("collapseBtn")
+        self.settings_toggle.setCheckable(True)
+        self.settings_toggle.setChecked(False)
+        self.settings_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.settings_toggle.setText("▸  高级/表格配置（已折叠，点此展开）")
+        self.settings_toggle.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        left.addWidget(self.settings_toggle)
+
+        self.settings_body = QFrame()
+        self.settings_body.setObjectName("settingsCard")
+        self.settings_body.setVisible(False)
+        sg = QVBoxLayout(self.settings_body)
+        sg.setContentsMargins(14, 12, 14, 12)
+        sg.setSpacing(8)
+        left.addWidget(self.settings_body)
+
+        def lab_sg(text, w):
+            c = QLabel(text)
+            c.setObjectName("fieldLabel")
+            sg.addWidget(c)
+            sg.addWidget(w)
 
         self.spreadsheet_edit = QLineEdit()
         self.spreadsheet_edit.setPlaceholderText("Google 表格 ID")
         self.sheet_combo = QComboBox()
         self.name_col_edit = QLineEdit("A")
         self.link_col_edit = QLineEdit("C")
-        self.output_edit = QLineEdit(os.path.join(os.path.expanduser("~"), "Downloads", "粘贴链接下载"))
 
-        def lab(text, w):
-            c = QLabel(text)
-            c.setObjectName("fieldLabel")
-            g.addWidget(c)
-            g.addWidget(w)
-
-        lab("表格 ID", self.spreadsheet_edit)
+        lab_sg("表格 ID", self.spreadsheet_edit)
         load_row = QHBoxLayout()
         self.load_sheet_btn = QPushButton("加载工作表 / 读取名称+链接列")
         self.load_sheet_btn.setObjectName("secondaryButton")
         load_row.addWidget(self.load_sheet_btn)
-        g.addLayout(load_row)
-        lab("工作表", self.sheet_combo)
+        sg.addLayout(load_row)
+        lab_sg("工作表", self.sheet_combo)
 
         cols = QHBoxLayout()
         for text, w in (("名称列", self.name_col_edit), ("链接列", self.link_col_edit)):
@@ -738,66 +779,63 @@ class PasteLinkDownloadPage(QWidget):
             box.addWidget(c)
             box.addWidget(w)
             cols.addLayout(box)
-        g.addLayout(cols)
-
-        lab("下载目录", self.output_edit)
-        out_row = QHBoxLayout()
-        pick_out = QPushButton("选择目录")
-        pick_out.setObjectName("secondaryButton")
-        pick_out.clicked.connect(self.choose_output)
-        out_row.addWidget(pick_out)
-        g.addLayout(out_row)
+        sg.addLayout(cols)
 
         self.folder_mode_combo = QComboBox()
         self.folder_mode_combo.addItems(["按人名", "按编号前缀", "按A列完整名称"])
-        lab("本地文件夹命名", self.folder_mode_combo)
+        lab_sg("本地文件夹命名", self.folder_mode_combo)
 
-        # 回填配置
-        bf = Card("回填列配置（均可改）", "settingsCard")
-        left.addWidget(bf)
-        bg = bf.layout
+        # 回填列映射
         self.count_col_edit = QLineEdit("D")
         self.status_col_edit = QLineEdit("E")
         self.person_col_edit = QLineEdit("F")
         self.date_col_edit = QLineEdit("G")
-        self.person_name_edit = QLineEdit()
-        self.person_name_edit.setPlaceholderText("下载人员姓名")
 
-        for text, w, tip in (
-            ("数量回填列（文件夹文件总数）", self.count_col_edit, "如下载文件夹内有 12 个文件则写 12"),
-            ("状态回填列（正在下载 / 已下载完成）", self.status_col_edit, "开始写「正在下载」，结束写「已下载完成」"),
-            ("下载人员回填列", self.person_col_edit, "写入下方填写的姓名"),
-            ("完成日期回填列（YYYY-MM-DD）", self.date_col_edit, "例如 2026-07-27"),
-        ):
-            c = QLabel(text)
-            c.setObjectName("fieldLabel")
-            w.setToolTip(tip)
-            bg.addWidget(c)
-            bg.addWidget(w)
+        bf_title = QLabel("回填列配置（字母可改）")
+        bf_title.setObjectName("fieldLabel")
+        sg.addWidget(bf_title)
 
-        c = QLabel("下载人员姓名")
-        c.setObjectName("fieldLabel")
-        bg.addWidget(c)
-        bg.addWidget(self.person_name_edit)
+        bf_grid = QGridLayout()
+        bf_grid.setHorizontalSpacing(10)
+        bf_grid.setVerticalSpacing(8)
+        bf_items = [
+            ("数量列", self.count_col_edit, "默认 D"),
+            ("状态列", self.status_col_edit, "默认 E"),
+            ("人员列", self.person_col_edit, "默认 F"),
+            ("日期列", self.date_col_edit, "默认 G"),
+        ]
+        for i, (l_txt, w_obj, tip) in enumerate(bf_items):
+            r, c = divmod(i, 2)
+            cell = QFrame()
+            cell_l = QVBoxLayout(cell)
+            cell_l.setContentsMargins(0, 0, 0, 0)
+            cell_l.setSpacing(3)
+            cap = QLabel(l_txt)
+            cap.setObjectName("fieldLabel")
+            w_obj.setToolTip(tip)
+            w_obj.setMinimumWidth(60)
+            cell_l.addWidget(cap)
+            cell_l.addWidget(w_obj)
+            bf_grid.addWidget(cell, r, c)
+        sg.addLayout(bf_grid)
 
         self.skip_check = QCheckBox("本地已有文件则跳过（断点续传）")
         self.skip_check.setChecked(True)
         self.skip_check.setToolTip("文件夹内已下过的文件会跳过，只补未下完的部分")
-        bg.addWidget(self.skip_check)
+        sg.addWidget(self.skip_check)
 
         self.dedupe_id_check = QCheckBox("按 Drive 文件/文件夹 ID 排重（同一内容不重复下）")
         self.dedupe_id_check.setChecked(True)
         self.dedupe_id_check.setToolTip(
             "根据 Google Drive 文件 ID 判断是否已下载过；粘贴列表重复 ID 也只下一次。"
-            "登记在下载目录的 .diy_drive_ids.json"
         )
-        bg.addWidget(self.dedupe_id_check)
+        sg.addWidget(self.dedupe_id_check)
 
         save_row = QHBoxLayout()
-        self.save_btn = QPushButton("保存设置")
+        self.save_btn = QPushButton("保存设置并折叠")
         self.save_btn.setObjectName("primaryButton")
         save_row.addWidget(self.save_btn)
-        bg.addLayout(save_row)
+        sg.addLayout(save_row)
 
         self.index_label = QLabel("尚未读取表格索引")
         self.index_label.setObjectName("status")
@@ -872,12 +910,17 @@ class PasteLinkDownloadPage(QWidget):
         root.addWidget(self.status_row)
 
     def connect_signals(self):
+        self.settings_toggle.toggled.connect(self._on_settings_toggled)
         self.load_sheet_btn.clicked.connect(self.load_index)
         self.save_btn.clicked.connect(self.save_settings)
         self.start_btn.clicked.connect(self.start_download)
         self.pause_btn.clicked.connect(self.toggle_pause)
         self.stop_btn.clicked.connect(self.stop_download)
         self.clear_btn.clicked.connect(self.clear_tasks)
+
+    def _on_settings_toggled(self, expanded: bool):
+        self.settings_body.setVisible(expanded)
+        self.settings_toggle.setText("▾  高级/表格配置（点此折叠）" if expanded else "▸  高级/表格配置（已折叠，点此展开）")
 
     def apply_page_fill(self, bg: str = "#0b1120"):
         def solid(w):
@@ -927,7 +970,8 @@ class PasteLinkDownloadPage(QWidget):
             with open(settings_path(), "w", encoding="utf-8") as f:
                 json.dump(self.config_dict(), f, ensure_ascii=False, indent=2)
             self.log(f"设置已保存：{settings_path()}")
-            self.status_row.setText("设置已保存")
+            self.status_row.setText("设置已保存并折叠")
+            self.settings_toggle.setChecked(False)
         except Exception as exc:
             QMessageBox.warning(self, APP_SECTION, f"保存失败：{exc}")
 

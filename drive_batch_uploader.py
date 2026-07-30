@@ -412,6 +412,7 @@ class UploadWorker(QThread):
         inbound_cols: dict | None = None,
         only_failed: bool = False,
         max_retries: int = 3,
+        max_threads: int = 4,
     ):
         super().__init__()
         self.credentials_path = credentials_path
@@ -425,17 +426,23 @@ class UploadWorker(QThread):
         self.skip_existing = skip_existing
         self.only_failed = only_failed
         self.max_retries = max(1, int(max_retries or 1))
+        self.max_threads = max(1, min(16, int(max_threads or 4)))
         cols = dict(DEFAULT_INBOUND_COLS)
         if inbound_cols:
             cols.update({k: normalize_col(v, cols.get(k, "A")) for k, v in inbound_cols.items() if k in cols})
         self.inbound_cols = cols
         self.stop_event = threading.Event()
+        self._counter_lock = threading.Lock()
 
     def stop(self):
         self.stop_event.set()
 
-    def _upload_one_file(self, client: GoogleClient, folder_id: str, file_item: UploadFileItem):
-        existing = client.find_file_in_folder(folder_id, file_item.name)
+    def _upload_one_file(self, client: GoogleClient, folder_id: str, file_item: UploadFileItem, existing_map: dict | None = None):
+        if existing_map is not None and file_item.name in existing_map:
+            existing = existing_map[file_item.name]
+        else:
+            existing = client.find_file_in_folder(folder_id, file_item.name) if existing_map is None else None
+
         if existing and self.skip_existing:
             return "skipped", existing.get("webViewLink") or ""
         if existing and not self.skip_existing:
@@ -446,10 +453,13 @@ class UploadWorker(QThread):
                 folder_id,
                 file_name=file_item.name,
                 mime_type=guess_mime(file_item.path),
+                existing_map=existing_map,
             )
         return "ok", created.get("webViewLink") or ""
 
     def run(self):
+        import concurrent.futures
+
         success = failed = skipped = 0
         pending_files = []
         for t in self.tasks:
@@ -468,7 +478,7 @@ class UploadWorker(QThread):
             self.log.emit(
                 f"已使用凭据：{client.account_label}；"
                 f"{'仅失败重试' if self.only_failed else '全量上传'}；"
-                f"单文件最多自动重试 {self.max_retries} 次"
+                f"并发线程数：{self.max_threads}；8MB 极速分块"
             )
             if not self.parent_folder_id.strip():
                 raise RuntimeError("请填写 Google Drive 父文件夹 ID")
@@ -480,7 +490,6 @@ class UploadWorker(QThread):
                     self.log.emit("任务已停止。")
                     break
 
-                # 仅失败重试：任务内若无待处理文件则跳过
                 task_files = list(enumerate(task.files))
                 if self.only_failed:
                     task_files = [
@@ -521,16 +530,28 @@ class UploadWorker(QThread):
                             continue
                         self.task_update.emit(task.index, f"失败：{exc}", "")
                         self.log.emit(f"任务#{task.index} 创建目录失败：{exc}")
-                        failed += len(task_files)
-                        done_files += len(task_files)
-                        self.progress.emit(done_files, total_files)
+                        with self._counter_lock:
+                            failed += len(task_files)
+                            done_files += len(task_files)
+                            self.progress.emit(done_files, total_files)
                         break
                 if not folder_ok:
                     continue
 
-                for fi, file_item in task_files:
+                # 一次性获取文件夹现有文件清单，做内存极速比对
+                existing_map = {}
+                if self.skip_existing:
+                    try:
+                        existing_map = client.list_folder_existing_files(folder_id)
+                    except Exception as e:
+                        self.log.emit(f"预读云端目录文件失败（将退回单文件查询）：{e}")
+                        existing_map = {}
+
+                def _process_one_file(item_tuple):
+                    nonlocal success, failed, skipped, done_files
                     if self.stop_event.is_set():
-                        break
+                        return
+                    fi, file_item = item_tuple
                     self.item_update.emit(task.index, fi, "上传中", "")
                     last_exc = None
                     uploaded = False
@@ -538,10 +559,11 @@ class UploadWorker(QThread):
                         if self.stop_event.is_set():
                             break
                         try:
-                            kind, file_url = self._upload_one_file(client, folder_id, file_item)
+                            kind, file_url = self._upload_one_file(client, folder_id, file_item, existing_map)
                             if kind == "skipped":
                                 self.item_update.emit(task.index, fi, "已存在，跳过", file_url)
-                                skipped += 1
+                                with self._counter_lock:
+                                    skipped += 1
                                 self._write_inbound(client, task, file_url)
                             else:
                                 self._write_inbound(client, task, file_url)
@@ -551,9 +573,10 @@ class UploadWorker(QThread):
                                         f"文件 [{file_item.name}] 上传成功，路径: {path_label}",
                                     )
                                 except Exception as log_exc:
-                                    self.log.emit(f"写上传日志失败：{log_exc}")
+                                    pass
                                 self.item_update.emit(task.index, fi, "成功", file_url)
-                                success += 1
+                                with self._counter_lock:
+                                    success += 1
                                 self.log.emit(f"成功：{file_item.name}" + (f"（第 {attempt} 次）" if attempt > 1 else ""))
                             uploaded = True
                             break
@@ -565,7 +588,7 @@ class UploadWorker(QThread):
                             if is_retryable_upload_error(exc) and attempt < self.max_retries:
                                 wait = min(1.5 * attempt, 8.0)
                                 self.log.emit(
-                                    f"失败将重试 {attempt}/{self.max_retries}：{file_item.name} -> {exc}；{wait:.1f}s 后重试"
+                                    f"失败重试 {attempt}/{self.max_retries}：{file_item.name} -> {exc}；{wait:.1f}s 后重试"
                                 )
                                 self.item_update.emit(
                                     task.index, fi, f"重试中 {attempt}/{self.max_retries}", ""
@@ -575,17 +598,28 @@ class UploadWorker(QThread):
                             break
 
                     if not uploaded and not self.stop_event.is_set():
-                        failed += 1
+                        with self._counter_lock:
+                            failed += 1
                         msg = str(last_exc or "未知错误")
                         self.item_update.emit(task.index, fi, f"失败：{msg}", "")
                         self.log.emit(f"失败：{file_item.name} -> {msg}")
-                        # 空间满时提示，避免傻重试整批
-                        low = msg.lower()
-                        if "storagequotaexceeded" in low or "quota has been exceeded" in low:
-                            self.log.emit("提示：云端盘空间已满，请清理空间后再点「重试失败项」。")
 
-                    done_files += 1
-                    self.progress.emit(done_files, total_files)
+                    with self._counter_lock:
+                        done_files += 1
+                        self.progress.emit(done_files, total_files)
+
+                # 使用线程池并发传输
+                if self.max_threads > 1:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_threads) as executor:
+                        futures = [executor.submit(_process_one_file, item) for item in task_files]
+                        for future in concurrent.futures.as_completed(futures):
+                            if self.stop_event.is_set():
+                                break
+                else:
+                    for item in task_files:
+                        if self.stop_event.is_set():
+                            break
+                        _process_one_file(item)
 
                 self.task_update.emit(task.index, "完成", task.folder_url)
 
@@ -770,8 +804,6 @@ class DriveBatchUploadPage(QWidget):
             ("成品入库表名称（工作表名，可改）", self.data_sheet_edit),
             ("分类目录名称（工作表名，可改）", self.category_sheet_edit),
             ("成品入库表日志名称（工作表名，可改）", self.log_sheet_edit),
-            ("默认上传者 *（写入 H 列，列可改）", self.uploader_edit),
-            ("默认审核人员（写入 G 列，列可改）", self.reviewer_edit),
         ]:
             sg.addWidget(self._labeled(label, widget))
 
@@ -851,9 +883,16 @@ class DriveBatchUploadPage(QWidget):
         set_btns.addWidget(self.sync_cred_btn)
         sg.addLayout(set_btns)
 
-        # 日常操作区（设置折叠后仍可见）
-        work = Card("选择分类 / 添加文件", "workCard")
+        # 日常操作区（常驻显示，设置折叠后依然可见）
+        work = Card("常规操作 / 上传设置", "workCard")
         left.addWidget(work)
+
+        # 上传者与审核人员常驻在常驻操作区
+        user_row = QHBoxLayout()
+        user_row.setSpacing(10)
+        user_row.addWidget(self._labeled("上传者 *", self.uploader_edit))
+        user_row.addWidget(self._labeled("审核人员", self.reviewer_edit))
+        work.layout.addLayout(user_row)
 
         mode_row = QHBoxLayout()
         self.mode_standard_btn = QPushButton("分类上传")
@@ -1674,6 +1713,7 @@ class DriveBatchUploadPage(QWidget):
             inbound_cols=self.inbound_cols_from_ui(),
             only_failed=only_failed,
             max_retries=3,
+            max_threads=getattr(self, "max_threads", 4),
         )
         worker.log.connect(self.log)
         worker.failed.connect(self.show_error)

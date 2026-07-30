@@ -535,6 +535,7 @@ class GoogleClient:
 
         self.sheets = build("sheets", "v4", credentials=self.creds)
         self.drive = build("drive", "v3", credentials=self.creds)
+        self._sheet_id_cache = {}
 
     def list_sheets(self, spreadsheet_id: str):
         result = self.sheets.spreadsheets().get(
@@ -719,7 +720,7 @@ class GoogleClient:
         request = self.drive.files().get_media(fileId=file_id, supportsAllDrives=True)
         try:
             with open(part_path, "wb") as f:
-                downloader = self.MediaIoBaseDownload(f, request, chunksize=1024 * 1024)
+                downloader = self.MediaIoBaseDownload(f, request, chunksize=8 * 1024 * 1024)
                 done = False
                 while not done:
                     if stop_event is not None and stop_event.is_set():
@@ -916,6 +917,32 @@ class GoogleClient:
         ).execute()
         return meta
 
+    def list_folder_existing_files(self, folder_id: str) -> dict:
+        """单次 API 查询返回文件夹内所有非文件夹文件名 -> {file_name: {id, webViewLink, name}}"""
+        query = (
+            f"'{folder_id}' in parents and trashed=false and "
+            f"mimeType!='application/vnd.google-apps.folder'"
+        )
+        page_token = None
+        existing = {}
+        while True:
+            result = self.drive.files().list(
+                q=query,
+                spaces="drive",
+                fields="nextPageToken, files(id,name,webViewLink)",
+                pageSize=1000,
+                pageToken=page_token or "",
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            ).execute()
+            for f in result.get("files") or []:
+                if f.get("name"):
+                    existing[f["name"]] = f
+            page_token = result.get("nextPageToken")
+            if not page_token:
+                break
+        return existing
+
     def find_file_in_folder(self, folder_id: str, file_name: str):
         safe = str(file_name or "").replace("'", "\\'")
         query = (
@@ -933,17 +960,21 @@ class GoogleClient:
         files = result.get("files") or []
         return files[0] if files else None
 
-    def upload_local_file(self, local_path: str, folder_id: str, file_name: str = "", mime_type: str = ""):
+    def upload_local_file(self, local_path: str, folder_id: str, file_name: str = "", mime_type: str = "", existing_map: dict | None = None):
         if not os.path.isfile(local_path):
             raise RuntimeError(f"本地文件不存在：{local_path}")
         name = file_name or os.path.basename(local_path)
-        existing = self.find_file_in_folder(folder_id, name)
-        if existing:
-            return existing
+        if existing_map is not None and name in existing_map:
+            return existing_map[name]
+        elif existing_map is None:
+            existing = self.find_file_in_folder(folder_id, name)
+            if existing:
+                return existing
         body = {"name": name, "parents": [folder_id]}
         media = self.MediaFileUpload(
             local_path,
             mimetype=mime_type or "application/octet-stream",
+            chunksize=8 * 1024 * 1024,
             resumable=True,
         )
         created = self.drive.files().create(
@@ -952,12 +983,14 @@ class GoogleClient:
             fields="id,name,webViewLink",
             supportsAllDrives=True,
         ).execute()
+        if existing_map is not None:
+            existing_map[name] = created
         return created
 
-    def insert_inbound_row(self, spreadsheet_id: str, sheet_name: str, row_values, insert_before_row: int = 7):
-        """在指定行上方插入一行并写入入库数据（对齐原 Web 端 insertRowBefore(7)）。"""
-        self.ensure_sheet(spreadsheet_id, sheet_name)
-        # 先获取 sheetId
+    def get_sheet_id(self, spreadsheet_id: str, sheet_name: str) -> int:
+        key = f"{spreadsheet_id}:{sheet_name}"
+        if key in getattr(self, "_sheet_id_cache", {}):
+            return self._sheet_id_cache[key]
         meta = self.sheets.spreadsheets().get(
             spreadsheetId=spreadsheet_id,
             fields="sheets(properties(sheetId,title))",
@@ -970,6 +1003,15 @@ class GoogleClient:
                 break
         if sheet_id is None:
             raise RuntimeError(f"找不到工作表：{sheet_name}")
+        if not hasattr(self, "_sheet_id_cache"):
+            self._sheet_id_cache = {}
+        self._sheet_id_cache[key] = sheet_id
+        return sheet_id
+
+    def insert_inbound_row(self, spreadsheet_id: str, sheet_name: str, row_values, insert_before_row: int = 7):
+        """在指定行上方插入一行并写入入库数据。"""
+        self.ensure_sheet(spreadsheet_id, sheet_name)
+        sheet_id = self.get_sheet_id(spreadsheet_id, sheet_name)
 
         index = max(0, int(insert_before_row) - 1)
         self.sheets.spreadsheets().batchUpdate(

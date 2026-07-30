@@ -27,11 +27,13 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -832,6 +834,19 @@ class MainWindow(QMainWindow):
         self.global_settings_btn.setToolTip("配置各功能共用的 Google 凭据（不放在表格下载里）")
         self.global_settings_btn.clicked.connect(self.open_global_settings)
 
+        thread_box = QHBoxLayout()
+        thread_box.setSpacing(4)
+        thread_label = QLabel("⚡并发:")
+        thread_label.setObjectName("fieldLabel")
+        self.threads_spin = QSpinBox()
+        self.threads_spin.setRange(1, 16)
+        self.threads_spin.setValue(4)
+        self.threads_spin.setSuffix(" 线程")
+        self.threads_spin.setToolTip("并发传输线程数（推荐 3-6 线程，支持多线程加速）")
+        self.threads_spin.valueChanged.connect(self._on_threads_changed)
+        thread_box.addWidget(thread_label)
+        thread_box.addWidget(self.threads_spin)
+
         self.theme_check = QCheckBox("暗黑模式")
         self.theme_check.setChecked(True)
         self.update_btn = QPushButton("检查更新")
@@ -841,6 +856,7 @@ class MainWindow(QMainWindow):
         self.help_btn = QPushButton("查看帮助")
         self.help_btn.setObjectName("ghostButton")
         header.addWidget(self.global_settings_btn)
+        header.addLayout(thread_box)
         header.addWidget(self.theme_check)
         header.addWidget(self.update_btn)
         header.addWidget(self.guide_btn)
@@ -875,18 +891,65 @@ class MainWindow(QMainWindow):
         sheets_left_scroll.setWidget(sheets_left_inner)
         sheets_h.addWidget(sheets_left_scroll)
 
-        compact_panel = QFrame()
-        compact_panel.setObjectName("compactPanel")
-        panel_layout = QVBoxLayout(compact_panel)
-        panel_layout.setContentsMargins(14, 12, 14, 12)
-        panel_layout.setSpacing(8)
-        sheets_left.addWidget(compact_panel)
+        # ----- 常驻常用操作卡片 -----
+        work_panel = QFrame()
+        work_panel.setObjectName("workCard")
+        work_layout = QVBoxLayout(work_panel)
+        work_layout.setContentsMargins(14, 12, 14, 12)
+        work_layout.setSpacing(8)
+        sheets_left.addWidget(work_panel)
 
-        cfg_title = QLabel("下载设置")
-        cfg_title.setObjectName("cardTitle")
-        panel_layout.addWidget(cfg_title)
+        work_title = QLabel("常用设置 / 操作")
+        work_title.setObjectName("cardTitle")
+        work_layout.addWidget(work_title)
 
         self.output_edit = QLineEdit(os.path.join(os.path.expanduser("~"), "Downloads", "批量下载"))
+        self.keyword_edit = QLineEdit()
+        self.keyword_edit.setPlaceholderText("例如：张三 或 张三-李四")
+
+        def add_work_field(label, w):
+            cap = QLabel(label)
+            cap.setObjectName("fieldLabel")
+            work_layout.addWidget(cap)
+            work_layout.addWidget(w)
+
+        add_work_field("只下载包含（关键字筛选）", self.keyword_edit)
+
+        cap_out = QLabel("下载目录（保存路径）")
+        cap_out.setObjectName("fieldLabel")
+        work_layout.addWidget(cap_out)
+        out_row = QHBoxLayout()
+        out_row.addWidget(self.output_edit, 1)
+        out_pick = QPushButton("选择目录")
+        out_pick.setObjectName("secondaryButton")
+        out_pick.clicked.connect(self.choose_output_dir)
+        out_row.addWidget(out_pick)
+        work_layout.addLayout(out_row)
+
+        # ----- 可折叠高级/表格配置 -----
+        self.sheets_settings_toggle = QToolButton()
+        self.sheets_settings_toggle.setObjectName("collapseBtn")
+        self.sheets_settings_toggle.setCheckable(True)
+        self.sheets_settings_toggle.setChecked(False)
+        self.sheets_settings_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.sheets_settings_toggle.setText("▸  高级/表格配置（已折叠，点此展开）")
+        self.sheets_settings_toggle.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        sheets_left.addWidget(self.sheets_settings_toggle)
+
+        self.sheets_settings_body = QFrame()
+        self.sheets_settings_body.setObjectName("settingsCard")
+        self.sheets_settings_body.setVisible(False)
+        sg = QVBoxLayout(self.sheets_settings_body)
+        sg.setContentsMargins(14, 12, 14, 12)
+        sg.setSpacing(8)
+        sheets_left.addWidget(self.sheets_settings_body)
+
+        def add_sg_field(label, w):
+            cap = QLabel(label)
+            cap.setObjectName("fieldLabel")
+            sg.addWidget(cap)
+            sg.addWidget(w)
+
         self.spreadsheet_edit = QLineEdit()
         self.spreadsheet_edit.setPlaceholderText("Google 表格 ID")
         self.sheet_combo = QComboBox()
@@ -898,8 +961,6 @@ class MainWindow(QMainWindow):
         self.count_backfill_col_edit.setToolTip("云端文件夹解析出的文件数量回填列（可自定义，留空则不回填数量）")
         self.folder_mode_combo = QComboBox()
         self.folder_mode_combo.addItems(["按人名", "按编号前缀", "按A列完整名称"])
-        self.keyword_edit = QLineEdit()
-        self.keyword_edit.setPlaceholderText("例如：张三 或 张三-李四")
         self.config_combo = QComboBox()
         self.config_name_edit = QLineEdit()
         self.config_name_edit.setPlaceholderText("方案名称")
@@ -910,47 +971,22 @@ class MainWindow(QMainWindow):
         self.run_all_btn = QPushButton("执行所有方案")
         self.run_all_btn.setObjectName("secondaryButton")
 
-        def add_v(label, w):
-            cap = QLabel(label)
-            cap.setObjectName("fieldLabel")
-            panel_layout.addWidget(cap)
-            panel_layout.addWidget(w)
-
-        add_v("配置方案", self.config_combo)
-        add_v("方案名", self.config_name_edit)
+        add_sg_field("配置方案", self.config_combo)
+        add_sg_field("方案名", self.config_name_edit)
         cfg_btns = QHBoxLayout()
         cfg_btns.addWidget(self.save_config_btn)
         cfg_btns.addWidget(self.delete_config_btn)
-        panel_layout.addLayout(cfg_btns)
-        panel_layout.addWidget(self.run_all_btn)
+        sg.addLayout(cfg_btns)
+        sg.addWidget(self.run_all_btn)
 
-        cap = QLabel("下载目录")
-        cap.setObjectName("fieldLabel")
-        panel_layout.addWidget(cap)
-        out_row = QHBoxLayout()
-        out_row.addWidget(self.output_edit, 1)
-        out_pick = QPushButton("选择")
-        out_pick.setObjectName("secondaryButton")
-        out_pick.clicked.connect(self.choose_output_dir)
-        out_row.addWidget(out_pick)
-        panel_layout.addLayout(out_row)
-
-        add_v("表格 ID", self.spreadsheet_edit)
+        add_sg_field("表格 ID", self.spreadsheet_edit)
         load_row = QHBoxLayout()
         load_btn = QPushButton("加载工作表")
         load_btn.setObjectName("secondaryButton")
         load_btn.clicked.connect(self.load_sheets)
         load_row.addWidget(load_btn)
-        panel_layout.addLayout(load_row)
-        add_v("工作表", self.sheet_combo)
-
-        tip_scan = QLabel(
-            "推荐：用「粘贴链接下载」只下粘贴内容并回填名字/数量（不扫链接列）。"
-            "「预览/开始下载」才会读链接列整列扫描。支持文件与云端文件夹。"
-        )
-        tip_scan.setObjectName("subtitle")
-        tip_scan.setWordWrap(True)
-        panel_layout.addWidget(tip_scan)
+        sg.addLayout(load_row)
+        add_sg_field("工作表", self.sheet_combo)
 
         cols = QHBoxLayout()
         for lab, w in (("名称列", self.name_col_edit), ("链接列(可选)", self.link_col_edit)):
@@ -960,9 +996,7 @@ class MainWindow(QMainWindow):
             box.addWidget(c)
             box.addWidget(w)
             cols.addLayout(box)
-        panel_layout.addLayout(cols)
-        self.link_col_edit.setToolTip("仅「表格整列扫描下载」需要。粘贴链接下载可不填、不遍历此列。")
-        self.name_col_edit.setToolTip("粘贴回填时用此列匹配行号；也用于整列扫描时的分类命名。")
+        sg.addLayout(cols)
 
         bf_cols = QHBoxLayout()
         for lab, w in (("名字回填列", self.backfill_col_edit), ("数量回填列", self.count_backfill_col_edit)):
@@ -972,17 +1006,16 @@ class MainWindow(QMainWindow):
             box.addWidget(c)
             box.addWidget(w)
             bf_cols.addLayout(box)
-        panel_layout.addLayout(bf_cols)
+        sg.addLayout(bf_cols)
 
-        add_v("文件夹命名（本地分类）", self.folder_mode_combo)
-        add_v("只下载包含", self.keyword_edit)
+        add_sg_field("文件夹命名（本地分类）", self.folder_mode_combo)
 
         self.skip_existing_check = QCheckBox("已下载过则跳过（同链接/同文件）")
         self.skip_existing_check.setChecked(True)
         self.backfill_check = QCheckBox("下载成功后回填表格（名字 + 数量）")
         self.backfill_check.setChecked(True)
-        panel_layout.addWidget(self.skip_existing_check)
-        panel_layout.addWidget(self.backfill_check)
+        sg.addWidget(self.skip_existing_check)
+        sg.addWidget(self.backfill_check)
 
         self.refresh_btn = QPushButton("刷新表格")
         self.refresh_btn.setObjectName("secondaryButton")
@@ -1004,7 +1037,7 @@ class MainWindow(QMainWindow):
             self.refresh_btn, self.preview_btn, self.start_btn, self.stop_btn,
             self.paste_links_btn, self.open_folder_btn, self.clear_log_btn,
         ):
-            panel_layout.addWidget(b)
+            work_layout.addWidget(b)
         sheets_left.addStretch(1)
 
         sheets_right = QVBoxLayout()
@@ -1057,6 +1090,7 @@ class MainWindow(QMainWindow):
         self.main_tabs.addTab(self.upload_page, "批量上传云端")
 
         # 信号
+        self.sheets_settings_toggle.toggled.connect(self._on_sheets_settings_toggled)
         self.main_tabs.currentChanged.connect(self._on_tab_changed)
         self.preview_btn.clicked.connect(self.preview_items)
         self.refresh_btn.clicked.connect(self.refresh_sheet_info)
@@ -1077,10 +1111,21 @@ class MainWindow(QMainWindow):
         # 仅同步共用凭据路径；上传表格 ID 独立，不从下载页回写
         self.credentials_edit.textChanged.connect(self._notify_shared_credentials)
 
+    def _on_sheets_settings_toggled(self, expanded: bool):
+        self.sheets_settings_body.setVisible(expanded)
+        self.sheets_settings_toggle.setText("▾  高级/表格配置（点此折叠）" if expanded else "▸  高级/表格配置（已折叠，点此展开）")
+
     def _on_tab_changed(self, index: int):
         # 切到上传页时只刷新共用凭据显示（表格 ID 各自独立）
         if index == 3 and hasattr(self, "upload_page"):
             self.upload_page.refresh_credentials_label()
+
+    def _on_threads_changed(self, val: int):
+        if hasattr(self, "upload_page"):
+            self.upload_page.max_threads = val
+        if hasattr(self, "paste_page"):
+            setattr(self.paste_page, "max_threads", val)
+        self.log(f"并发传输线程数已调整为：{val} 线程。")
 
     def goto_paste_link_tab(self):
         """表格页按钮跳转到独立「粘贴链接下载」板块。"""
