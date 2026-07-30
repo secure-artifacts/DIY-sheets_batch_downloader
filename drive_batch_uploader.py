@@ -433,6 +433,12 @@ class UploadWorker(QThread):
         self.inbound_cols = cols
         self.stop_event = threading.Event()
         self._counter_lock = threading.Lock()
+        self._thread_local = threading.local()
+
+    def _get_thread_client(self) -> GoogleClient:
+        if not hasattr(self._thread_local, "client"):
+            self._thread_local.client = GoogleClient(self.credentials_path, self.token_path)
+        return self._thread_local.client
 
     def stop(self):
         self.stop_event.set()
@@ -555,20 +561,21 @@ class UploadWorker(QThread):
                     self.item_update.emit(task.index, fi, "上传中", "")
                     last_exc = None
                     uploaded = False
+                    thread_client = self._get_thread_client()
                     for attempt in range(1, self.max_retries + 1):
                         if self.stop_event.is_set():
                             break
                         try:
-                            kind, file_url = self._upload_one_file(client, folder_id, file_item, existing_map)
+                            kind, file_url = self._upload_one_file(thread_client, folder_id, file_item, existing_map)
                             if kind == "skipped":
                                 self.item_update.emit(task.index, fi, "已存在，跳过", file_url)
                                 with self._counter_lock:
                                     skipped += 1
-                                self._write_inbound(client, task, file_url)
+                                self._write_inbound(thread_client, task, file_url)
                             else:
-                                self._write_inbound(client, task, file_url)
+                                self._write_inbound(thread_client, task, file_url)
                                 try:
-                                    client.append_upload_log(
+                                    thread_client.append_upload_log(
                                         self.spreadsheet_id, self.log_sheet, "INFO",
                                         f"文件 [{file_item.name}] 上传成功，路径: {path_label}",
                                     )
@@ -1332,18 +1339,25 @@ class DriveBatchUploadPage(QWidget):
     def on_paths_dropped(self, paths: list):
         files, folders = [], []
         for p in paths:
-            if os.path.isfile(p):
-                files.append(p)
-            elif os.path.isdir(p):
-                folders.append(p)
+            if not p:
+                continue
+            norm = os.path.normpath(os.path.abspath(p))
+            if os.path.isfile(norm):
+                files.append(norm)
+            elif os.path.isdir(norm):
+                folders.append(norm)
         if folders:
             for folder in folders:
                 self._ingest_category_folder(folder)
         if files:
             self.pending_files.extend(files)
             self.pending_files = list(dict.fromkeys(self.pending_files))
-            self.pending_label.setText(f"待添加：{len(self.pending_files)} 个文件（再点「加入清单」）")
+            self.pending_label.setText(f"待添加：{len(self.pending_files)} 个文件")
             self.log(f"拖入文件 {len(files)} 个。")
+            uploader = self.uploader_edit.text().strip()
+            cat1 = self.cat1_combo.currentText().strip()
+            if uploader and (cat1 or self.is_image_mode):
+                self.add_task()
 
     def pick_files(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "选择文件", "", "所有文件 (*.*)")
@@ -1360,23 +1374,15 @@ class DriveBatchUploadPage(QWidget):
 
     def _ingest_category_folder(self, folder: str):
         """递归扫描文件夹，按相对路径匹配分类，自动生成多个任务。"""
-        if not self.category_rows:
-            QMessageBox.information(
-                self, APP_SECTION,
-                "请先「加载分类目录」，才能根据文件夹名自动匹配一/二/三级。",
-            )
-            return
-        uploader = self.uploader_edit.text().strip()
-        if not uploader:
-            QMessageBox.warning(self, APP_SECTION, "请先在设置中填写默认上传者。")
-            return
+        uploader = self.uploader_edit.text().strip() or "默认上传者"
+        reviewer = self.reviewer_edit.text().strip()
+        clean_meta = self.clean_meta_text()
 
         all_files = list_files_recursive(folder)
         if not all_files:
-            QMessageBox.information(self, APP_SECTION, "文件夹内没有文件。")
+            QMessageBox.information(self, APP_SECTION, f"文件夹内没有文件：{os.path.basename(folder)}")
             return
 
-        # group by matched (c1,c2,c3,c4, is_image)
         groups: dict[tuple, list[str]] = {}
         unmatched = []
         root = os.path.abspath(folder)
@@ -1386,18 +1392,18 @@ class DriveBatchUploadPage(QWidget):
             rel = os.path.relpath(fpath, root)
             parts = rel.replace("\\", "/").split("/")
             dir_parts = parts[:-1]
-            # 把根文件夹名也加入匹配链（若本地是「自拍素材/动物/..」整夹拖入）
             chain = [root_name] + dir_parts if root_name else dir_parts
-            c1, c2, c3, c4 = match_path_to_category(chain, self.category_rows)
-            if not c1:
-                # 再试：不用根名，仅用相对目录
-                c1, c2, c3, c4 = match_path_to_category(dir_parts, self.category_rows)
+
+            c1, c2, c3, c4 = "", "", "", ""
+            if self.category_rows:
+                c1, c2, c3, c4 = match_path_to_category(chain, self.category_rows)
+                if not c1:
+                    c1, c2, c3, c4 = match_path_to_category(dir_parts, self.category_rows)
             ext = os.path.splitext(fpath)[1].lower()
             is_img = ext in IMAGE_EXTS and self.is_image_mode
             if not c1 and not is_img:
                 unmatched.append(fpath)
-                # 仍尝试用当前下拉选择
-                c1 = self.cat1_combo.currentText().strip()
+                c1 = self.cat1_combo.currentText().strip() or root_name or "未分类素材"
                 c2 = self.cat2_combo.currentText().strip()
                 c3 = self.cat3_combo.currentText().strip()
                 c4 = self.video_type_combo.currentText().strip()
@@ -1408,8 +1414,6 @@ class DriveBatchUploadPage(QWidget):
         for (c1, c2, c3, c4, is_img), files in groups.items():
             if not files:
                 continue
-            if not is_img and not c1:
-                continue
             self.task_seq += 1
             task = UploadTask(
                 index=self.task_seq,
@@ -1419,22 +1423,21 @@ class DriveBatchUploadPage(QWidget):
                 cat3="" if is_img else c3,
                 video_type="" if is_img else c4,
                 uploader=uploader,
-                reviewer=self.reviewer_edit.text().strip(),
-                clean_meta=self.clean_meta_text(),
+                reviewer=reviewer,
+                clean_meta=clean_meta,
                 files=[UploadFileItem(path=p, name=os.path.basename(p)) for p in files],
                 source_folder=folder,
             )
             self.tasks.append(task)
             added += 1
             self.log(
-                f"自动任务#{task.index}："
-                f"{'/'.join([x for x in [c1, c2, c3, c4] if x]) or '图片'} · {len(files)} 文件"
+                f"自动任务#{task.index}（[{uploader}] {'/'.join([x for x in [c1, c2, c3, c4] if x]) or '图片'}）：{len(files)} 文件"
             )
 
         self.rebuild_table()
-        if unmatched:
-            self.log(f"有 {len(unmatched)} 个文件未匹配到分类（已尽量归入当前下拉选择）。")
-        self.status_row.setText(f"从文件夹自动加入 {added} 个任务")
+        if unmatched and self.category_rows:
+            self.log(f"提示：有 {len(unmatched)} 个文件未全匹配表格分类，已归入指定分类。")
+        self.status_row.setText(f"从文件夹自动加入 {added} 个任务（上传者：{uploader}）")
         self.log(f"文件夹扫描完成：{folder}")
 
     def add_task(self):
@@ -1590,9 +1593,9 @@ class DriveBatchUploadPage(QWidget):
         rows = []
         for task in self.tasks:
             mode = "图片" if task.is_image_mode else "分类"
-            path_label = " / ".join(
-                [x for x in [task.cat1, task.cat2, task.cat3, task.video_type, task.uploader] if x]
-            )
+            cats = " / ".join([x for x in [task.cat1, task.cat2, task.cat3, task.video_type] if x])
+            uploader_tag = f"[{task.uploader}] " if task.uploader else ""
+            path_label = f"{uploader_tag}{cats or '图片素材'}"
             for f in task.files:
                 rows.append((task, f, mode, path_label))
         self.table.setRowCount(len(rows))
@@ -1626,7 +1629,8 @@ class DriveBatchUploadPage(QWidget):
         lines = []
         for task in self.tasks:
             title = " / ".join([x for x in [task.cat1, task.cat2, task.cat3, task.video_type] if x])
-            lines.append(f"【任务#{task.index}】{title or '图片直传'}")
+            uploader_tag = f"[{task.uploader}] " if task.uploader else ""
+            lines.append(f"【任务#{task.index}】{uploader_tag}{title or '图片直传'}")
             if task.folder_url:
                 lines.append(f"  文件夹：{task.folder_url}")
             for f in task.files:
@@ -1692,9 +1696,12 @@ class DriveBatchUploadPage(QWidget):
             self.settings_toggle.setChecked(True)
             return
         for t in self.tasks:
-            t.uploader = uploader
-            t.reviewer = reviewer
-            t.clean_meta = clean_meta
+            if not t.uploader:
+                t.uploader = uploader
+            if not t.reviewer and reviewer:
+                t.reviewer = reviewer
+            if not t.clean_meta and clean_meta:
+                t.clean_meta = clean_meta
 
         self.set_running(True)
         self.progress_bar.setValue(0)
