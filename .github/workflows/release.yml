@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Optional existing tag to build (e.g. v1.5.2). Leave empty to use current branch."
+        required: false
+        default: ""
 
 permissions:
   id-token: write
