@@ -16,6 +16,10 @@ permissions:
   contents: write
   attestations: write
 
+env:
+  # tag push -> ref_name; manual dispatch can pass inputs.tag (e.g. v1.5.2)
+  RELEASE_TAG: ${{ github.event.inputs.tag != '' && github.event.inputs.tag || github.ref_name }}
+
 jobs:
   build-windows:
     name: Build Windows
@@ -45,7 +49,7 @@ jobs:
           if ($raw -match 'APP_VERSION\s*=\s*"([^"]+)"') {
             $v = $Matches[1]
           } else {
-            $v = "${{ github.ref_name }}".TrimStart("v")
+            $v = "${{ env.RELEASE_TAG }}".TrimStart("v")
           }
           "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           Write-Host "APP_VERSION=$v"
@@ -82,7 +86,7 @@ jobs:
           }
 
           New-Item -ItemType Directory -Force -Path "release" | Out-Null
-          $tag = "${{ github.ref_name }}"
+          $tag = "${{ env.RELEASE_TAG }}"
 
           # 便携版：整个目录打 zip（解压即用，不经 Temp 解压 DLL）
           $zipPath = "release\DIYDownloader-$tag-windows.zip"
@@ -101,7 +105,7 @@ jobs:
       - name: Build Windows installer
         shell: pwsh
         run: |
-          $tag = "${{ github.ref_name }}"
+          $tag = "${{ env.RELEASE_TAG }}"
           $ver = "${{ steps.ver.outputs.version }}"
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
           $srcDir = (Resolve-Path "dist\DIYDownloader").Path
@@ -123,8 +127,8 @@ jobs:
         with:
           name: windows-release
           path: |
-            release/DIYDownloader-${{ github.ref_name }}-windows.zip
-            release/DIYDownloader-${{ github.ref_name }}-windows-setup.exe
+            release/DIYDownloader-${{ env.RELEASE_TAG }}-windows.zip
+            release/DIYDownloader-${{ env.RELEASE_TAG }}-windows-setup.exe
           if-no-files-found: error
 
   build-macos:
@@ -167,13 +171,13 @@ jobs:
             "sheets_batch_downloader_modern.py"
 
           mkdir -p release
-          ditto -c -k --sequesterRsrc --keepParent "dist/DIYDownloader.app" "release/DIYDownloader-${{ github.ref_name }}-macos.zip"
+          ditto -c -k --sequesterRsrc --keepParent "dist/DIYDownloader.app" "release/DIYDownloader-${{ env.RELEASE_TAG }}-macos.zip"
 
       - name: Upload macOS artifact
         uses: actions/upload-artifact@v4
         with:
           name: macos-release
-          path: release/DIYDownloader-${{ github.ref_name }}-macos.zip
+          path: release/DIYDownloader-${{ env.RELEASE_TAG }}-macos.zip
           if-no-files-found: error
 
   release:
@@ -204,7 +208,8 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
           files: "release/*"
-          name: "DIY下载器 ${{ github.ref_name }}"
+          name: "DIY下载器 ${{ env.RELEASE_TAG }}"
           body_path: release_notes.md
           generate_release_notes: true
