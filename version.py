@@ -1,7 +1,7 @@
 # Application version — update APP_VERSION on each release.
 
 APP_NAME = "DIY下载器"
-APP_VERSION = "1.4.4"
+APP_VERSION = "1.5.2"
 GITHUB_OWNER = "secure-artifacts"
 GITHUB_REPO = "DIY-sheets_batch_downloader"
 GITHUB_REPO_SLUG = f"{GITHUB_OWNER}/{GITHUB_REPO}"
