@@ -99,26 +99,67 @@ def call_with_network_retry(fn, *, retries: int = 3, delay: float = 1.2, log=Non
     raise RuntimeError(friendly_network_error(last_exc)) from last_exc
 
 
+def _normalize_scope_set(scopes) -> set:
+    if not scopes:
+        return set()
+    if isinstance(scopes, str):
+        scopes = scopes.replace(",", " ").split()
+    return {str(s).strip() for s in scopes if str(s).strip()}
+
+
+def scopes_cover_required(scopes) -> bool:
+    """scopes 是否覆盖表格读写 + Drive（full 或 drive.file）。"""
+    have = _normalize_scope_set(scopes)
+    has_sheets = "https://www.googleapis.com/auth/spreadsheets" in have
+    has_drive = (
+        "https://www.googleapis.com/auth/drive" in have
+        or "https://www.googleapis.com/auth/drive.file" in have
+    )
+    return has_sheets and has_drive
+
+
 def token_has_required_scopes(token_path: str) -> bool:
-    """检查 token 是否已具备表格 + Drive 写权限（授权一次即可复用）。"""
+    """检查 token 文件是否已具备表格 + Drive 写权限。"""
     if not os.path.exists(token_path):
         return False
     try:
         with open(token_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        token_scopes = data.get("scopes") or data.get("scope") or []
-        if isinstance(token_scopes, str):
-            token_scopes = token_scopes.split()
-        have = set(token_scopes)
-        has_sheets = "https://www.googleapis.com/auth/spreadsheets" in have
-        # full drive 或 drive.file 均可上传
-        has_drive = (
-            "https://www.googleapis.com/auth/drive" in have
-            or "https://www.googleapis.com/auth/drive.file" in have
-        )
-        return has_sheets and has_drive
+        return scopes_cover_required(data.get("scopes") or data.get("scope") or [])
     except Exception:
         return False
+
+
+def save_user_token(creds, token_path: str) -> None:
+    """持久化 OAuth token；失败要抛错，避免静默丢授权导致每次重登。"""
+    if creds is None:
+        raise RuntimeError("无法保存授权：credentials 为空。")
+    folder = os.path.dirname(os.path.abspath(token_path)) or "."
+    os.makedirs(folder, exist_ok=True)
+    # 确保 scopes 写入文件，避免下次误判权限不足
+    raw = creds.to_json()
+    try:
+        data = json.loads(raw)
+    except Exception:
+        data = None
+    if isinstance(data, dict):
+        if not data.get("scopes") and getattr(creds, "scopes", None):
+            data["scopes"] = list(creds.scopes)
+        if not data.get("refresh_token") and getattr(creds, "refresh_token", None):
+            # 合并保留旧 refresh_token（Google 再次授权有时不返回 refresh_token）
+            if os.path.exists(token_path):
+                try:
+                    with open(token_path, "r", encoding="utf-8") as oldf:
+                        old = json.load(oldf)
+                    if old.get("refresh_token"):
+                        data["refresh_token"] = old["refresh_token"]
+                except Exception:
+                    pass
+        raw = json.dumps(data)
+    tmp_path = token_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(raw)
+    os.replace(tmp_path, token_path)
 
 
 def require_google_libs():
@@ -495,43 +536,100 @@ class GoogleClient:
             )
             self.account_label = credentials_info.get("client_email", "service_account")
         else:
+            # OAuth 用户：优先复用 token.json，过期只刷新，不反复弹浏览器
             creds = None
-            # 优先复用已授权 token（刷新即可，不弹浏览器）
+            load_error = ""
             if os.path.exists(token_path):
                 try:
                     creds = Credentials.from_authorized_user_file(token_path, SCOPES)
-                except Exception:
+                except Exception as exc:
+                    load_error = str(exc)
                     creds = None
 
             need_browser = False
+            reauth_reason = ""
+            auth_mode = "reuse"  # reuse | refresh | browser
+
             if not creds:
                 need_browser = True
-            elif not creds.valid:
-                if creds.refresh_token:
-                    try:
-                        creds.refresh(GoogleAuthRequest())
-                    except Exception:
+                reauth_reason = load_error or f"未找到授权文件：{token_path}"
+            else:
+                # 1) access token 过期 → 用 refresh_token 静默刷新（不要因网络失败去弹浏览器）
+                if not creds.valid:
+                    if not creds.refresh_token:
                         need_browser = True
-                else:
-                    need_browser = True
-            elif not token_has_required_scopes(token_path):
-                # 旧 token 权限不够（例如只有 drive.readonly）才重新授权一次
-                need_browser = True
+                        reauth_reason = "授权文件缺少 refresh_token，需重新登录一次以获取长期授权"
+                    else:
+                        try:
+                            creds.refresh(GoogleAuthRequest())
+                            auth_mode = "refresh"
+                            try:
+                                save_user_token(creds, token_path)
+                            except Exception:
+                                pass
+                        except Exception as refresh_exc:
+                            # 网络类错误：交给上层重试，不要误判成“要重新授权”
+                            if is_transient_network_error(refresh_exc):
+                                raise RuntimeError(friendly_network_error(refresh_exc)) from refresh_exc
+                            # refresh_token 被吊销/过期（测试应用约 7 天）才真正需要浏览器
+                            need_browser = True
+                            reauth_reason = f"刷新授权失败，需要重新登录：{refresh_exc}"
+
+                # 2) 权限不足才重登（优先看内存 scopes，其次看文件）
+                if not need_browser:
+                    scopes_ok = scopes_cover_required(getattr(creds, "scopes", None))
+                    if not scopes_ok:
+                        scopes_ok = token_has_required_scopes(token_path)
+                    if not scopes_ok:
+                        need_browser = True
+                        reauth_reason = "当前授权缺少表格或 Drive 权限，需重新勾选权限登录"
 
             if need_browser:
+                auth_mode = "browser"
                 flow = InstalledAppFlow.from_client_secrets_file(credentials_path, SCOPES)
-                creds = flow.run_local_server(port=0)
+                creds = flow.run_local_server(
+                    port=0,
+                    access_type="offline",
+                    prompt="consent",
+                    open_browser=True,
+                )
+                if not getattr(creds, "refresh_token", None) and os.path.exists(token_path):
+                    try:
+                        with open(token_path, "r", encoding="utf-8") as oldf:
+                            old = json.load(oldf)
+                        if old.get("refresh_token"):
+                            creds = Credentials(
+                                token=creds.token,
+                                refresh_token=old.get("refresh_token"),
+                                token_uri=creds.token_uri,
+                                client_id=creds.client_id,
+                                client_secret=creds.client_secret,
+                                scopes=list(creds.scopes) if creds.scopes else list(SCOPES),
+                            )
+                    except Exception:
+                        pass
 
-            # 持久化，下次直接用
+            # 持久化：失败要让用户知道，否则会“每次都要授权”
             try:
-                os.makedirs(os.path.dirname(os.path.abspath(token_path)) or ".", exist_ok=True)
-                with open(token_path, "w", encoding="utf-8") as f:
-                    f.write(creds.to_json())
-            except Exception:
-                pass
+                save_user_token(creds, token_path)
+            except Exception as save_exc:
+                raise RuntimeError(
+                    f"授权成功但无法保存到本机，下次仍会要求重新登录。\n"
+                    f"路径：{token_path}\n"
+                    f"原因：{save_exc}\n"
+                    f"请检查该目录写入权限，或关闭占用 token.json 的杀毒软件。"
+                ) from save_exc
 
             self.creds = creds
-            self.account_label = "OAuth 用户"
+            if auth_mode == "browser":
+                self.account_label = "OAuth 用户（刚重新登录）"
+            elif auth_mode == "refresh":
+                self.account_label = "OAuth 用户（已自动续期）"
+            else:
+                self.account_label = "OAuth 用户（复用本机授权）"
+            self.auth_mode = auth_mode
+            self.auth_token_path = token_path
+            self._auth_reauth_reason = reauth_reason if need_browser else ""
 
         self.sheets = build("sheets", "v4", credentials=self.creds)
         self.drive = build("drive", "v3", credentials=self.creds)

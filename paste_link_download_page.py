@@ -1326,11 +1326,16 @@ class _SheetListThenIndexWorker(QThread):
                 index = client.read_name_link_index(
                     self.spreadsheet_id, sheet_name, self.name_col, self.link_col
                 )
-                return sheets, sheet_name, index
+                return client, sheets, sheet_name, index
 
-            sheets, sheet_name, index = call_with_network_retry(
+            client, sheets, sheet_name, index = call_with_network_retry(
                 _load, retries=3, delay=1.2, log=self.log.emit
             )
+            self.log.emit(
+                f"授权：{client.account_label} · {getattr(client, 'auth_token_path', self.token_path)}"
+            )
+            if getattr(client, "_auth_reauth_reason", ""):
+                self.log.emit(f"本次重新登录原因：{client._auth_reauth_reason}")
             self.log.emit(f"使用工作表「{sheet_name}」读取名称列 {self.name_col} / 链接列 {self.link_col}")
             with_links = sum(1 for r in index if r.get("url"))
             self.log.emit(f"索引完成：{len(index)} 行，{with_links} 条链接。")
