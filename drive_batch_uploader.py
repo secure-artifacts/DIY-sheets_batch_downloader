@@ -433,34 +433,46 @@ class UploadWorker(QThread):
         self.inbound_cols = cols
         self.stop_event = threading.Event()
         self._counter_lock = threading.Lock()
+        self._existing_lock = threading.Lock()
         self._thread_local = threading.local()
 
     def _get_thread_client(self) -> GoogleClient:
+        """后台线程客户端：禁止弹浏览器，且构造时走 token 全局锁。"""
         if not hasattr(self._thread_local, "client"):
-            self._thread_local.client = GoogleClient(self.credentials_path, self.token_path)
+            self._thread_local.client = GoogleClient(
+                self.credentials_path,
+                self.token_path,
+                allow_browser=False,
+            )
         return self._thread_local.client
 
     def stop(self):
         self.stop_event.set()
 
     def _upload_one_file(self, client: GoogleClient, folder_id: str, file_item: UploadFileItem, existing_map: dict | None = None):
-        if existing_map is not None and file_item.name in existing_map:
-            existing = existing_map[file_item.name]
+        existing = None
+        if existing_map is not None:
+            with self._existing_lock:
+                existing = existing_map.get(file_item.name)
         else:
-            existing = client.find_file_in_folder(folder_id, file_item.name) if existing_map is None else None
+            existing = client.find_file_in_folder(folder_id, file_item.name)
 
         if existing and self.skip_existing:
             return "skipped", existing.get("webViewLink") or ""
         if existing and not self.skip_existing:
             created = existing
         else:
+            # 不把 existing_map 传给 upload（避免无锁写共享 dict）；上传成功后由外层登记
             created = client.upload_local_file(
                 file_item.path,
                 folder_id,
                 file_name=file_item.name,
                 mime_type=guess_mime(file_item.path),
-                existing_map=existing_map,
+                existing_map=None,
             )
+            if existing_map is not None and created:
+                with self._existing_lock:
+                    existing_map[file_item.name] = created
         return "ok", created.get("webViewLink") or ""
 
     def run(self):
@@ -567,24 +579,30 @@ class UploadWorker(QThread):
                             break
                         try:
                             kind, file_url = self._upload_one_file(thread_client, folder_id, file_item, existing_map)
+                            # 云端上传成功后，入库/日志失败不重传文件，只记警告
+                            try:
+                                self._write_inbound(thread_client, task, file_url)
+                            except Exception as sheet_exc:
+                                self.log.emit(f"入库表写入失败（文件已上传）：{file_item.name} -> {sheet_exc}")
                             if kind == "skipped":
                                 self.item_update.emit(task.index, fi, "已存在，跳过", file_url)
                                 with self._counter_lock:
                                     skipped += 1
-                                self._write_inbound(thread_client, task, file_url)
                             else:
-                                self._write_inbound(thread_client, task, file_url)
                                 try:
                                     thread_client.append_upload_log(
                                         self.spreadsheet_id, self.log_sheet, "INFO",
                                         f"文件 [{file_item.name}] 上传成功，路径: {path_label}",
                                     )
-                                except Exception as log_exc:
+                                except Exception:
                                     pass
                                 self.item_update.emit(task.index, fi, "成功", file_url)
                                 with self._counter_lock:
                                     success += 1
-                                self.log.emit(f"成功：{file_item.name}" + (f"（第 {attempt} 次）" if attempt > 1 else ""))
+                                self.log.emit(
+                                    f"成功：{file_item.name}"
+                                    + (f"（第 {attempt} 次）" if attempt > 1 else "")
+                                )
                             uploaded = True
                             break
                         except Exception as exc:
@@ -615,23 +633,60 @@ class UploadWorker(QThread):
                         done_files += 1
                         self.progress.emit(done_files, total_files)
 
-                # 使用线程池并发传输
-                if self.max_threads > 1:
+                # 并发传输：单文件失败不中断整批；线程异常必须 result() 捞出来记日志
+                self.log.emit(f"任务#{task.index} 开始上传 {len(task_files)} 个文件…")
+                if self.max_threads > 1 and len(task_files) > 1:
                     with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_threads) as executor:
-                        futures = [executor.submit(_process_one_file, item) for item in task_files]
+                        futures = {
+                            executor.submit(_process_one_file, item): item
+                            for item in task_files
+                        }
                         for future in concurrent.futures.as_completed(futures):
                             if self.stop_event.is_set():
-                                break
+                                # 不 cancel 其它任务，尽量让已在跑的传完；循环继续收割结果
+                                pass
+                            try:
+                                future.result()
+                            except Exception as exc:
+                                item = futures.get(future)
+                                name = ""
+                                try:
+                                    name = item[1].name if item else ""
+                                except Exception:
+                                    pass
+                                with self._counter_lock:
+                                    failed += 1
+                                    done_files += 1
+                                    self.progress.emit(done_files, total_files)
+                                self.log.emit(f"线程异常（已继续后续文件）{name}: {exc}")
                 else:
                     for item in task_files:
                         if self.stop_event.is_set():
+                            self.log.emit("任务已停止（后续文件未传）。")
                             break
-                        _process_one_file(item)
+                        try:
+                            _process_one_file(item)
+                        except Exception as exc:
+                            with self._counter_lock:
+                                failed += 1
+                                done_files += 1
+                                self.progress.emit(done_files, total_files)
+                            self.log.emit(f"单文件异常（已继续）：{exc}")
 
+                if self.stop_event.is_set():
+                    self.task_update.emit(task.index, "已停止", task.folder_url)
+                    break
                 self.task_update.emit(task.index, "完成", task.folder_url)
+                self.log.emit(
+                    f"任务#{task.index} 结束：累计成功 {success}，跳过 {skipped}，失败 {failed}。"
+                )
 
-            self.log.emit(f"上传结束：成功 {success}，跳过 {skipped}，失败 {failed}。")
+            self.log.emit(
+                f"全部上传结束：成功 {success}，跳过 {skipped}，失败 {failed}，"
+                f"进度 {done_files}/{total_files}。"
+            )
         except Exception as exc:
+            self.log.emit(f"上传主流程异常（已尽量传完当前批次前的文件）：{exc}")
             self.failed.emit(str(exc))
         finally:
             self.done.emit()

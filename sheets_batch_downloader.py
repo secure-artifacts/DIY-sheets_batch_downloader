@@ -509,8 +509,14 @@ class DownloadItem:
     file_number: str
 
 
+# 多线程同时 new GoogleClient 时，刷新/写 token 必须串行，否则会互相踢掉 refresh_token
+_TOKEN_IO_LOCK = threading.RLock()
+# 入库表 insert 行必须串行，并发 insert 同一位置会互相覆盖/报错导致后续全挂
+_SHEETS_WRITE_LOCK = threading.RLock()
+
+
 class GoogleClient:
-    def __init__(self, credentials_path: str, token_path: str):
+    def __init__(self, credentials_path: str, token_path: str, allow_browser: bool = True):
         (
             GoogleAuthRequest,
             service_account,
@@ -522,6 +528,7 @@ class GoogleClient:
         ) = require_google_libs()
         self.MediaIoBaseDownload = MediaIoBaseDownload
         self.MediaFileUpload = MediaFileUpload
+        self.allow_browser = allow_browser
 
         if not os.path.exists(credentials_path):
             raise RuntimeError("找不到凭据 JSON 文件。")
@@ -535,101 +542,106 @@ class GoogleClient:
                 scopes=SCOPES,
             )
             self.account_label = credentials_info.get("client_email", "service_account")
+            self.auth_mode = "service_account"
+            self.auth_token_path = ""
+            self._auth_reauth_reason = ""
         else:
-            # OAuth 用户：优先复用 token.json，过期只刷新，不反复弹浏览器
-            creds = None
-            load_error = ""
-            if os.path.exists(token_path):
-                try:
-                    creds = Credentials.from_authorized_user_file(token_path, SCOPES)
-                except Exception as exc:
-                    load_error = str(exc)
-                    creds = None
-
-            need_browser = False
-            reauth_reason = ""
-            auth_mode = "reuse"  # reuse | refresh | browser
-
-            if not creds:
-                need_browser = True
-                reauth_reason = load_error or f"未找到授权文件：{token_path}"
-            else:
-                # 1) access token 过期 → 用 refresh_token 静默刷新（不要因网络失败去弹浏览器）
-                if not creds.valid:
-                    if not creds.refresh_token:
-                        need_browser = True
-                        reauth_reason = "授权文件缺少 refresh_token，需重新登录一次以获取长期授权"
-                    else:
-                        try:
-                            creds.refresh(GoogleAuthRequest())
-                            auth_mode = "refresh"
-                            try:
-                                save_user_token(creds, token_path)
-                            except Exception:
-                                pass
-                        except Exception as refresh_exc:
-                            # 网络类错误：交给上层重试，不要误判成“要重新授权”
-                            if is_transient_network_error(refresh_exc):
-                                raise RuntimeError(friendly_network_error(refresh_exc)) from refresh_exc
-                            # refresh_token 被吊销/过期（测试应用约 7 天）才真正需要浏览器
-                            need_browser = True
-                            reauth_reason = f"刷新授权失败，需要重新登录：{refresh_exc}"
-
-                # 2) 权限不足才重登（优先看内存 scopes，其次看文件）
-                if not need_browser:
-                    scopes_ok = scopes_cover_required(getattr(creds, "scopes", None))
-                    if not scopes_ok:
-                        scopes_ok = token_has_required_scopes(token_path)
-                    if not scopes_ok:
-                        need_browser = True
-                        reauth_reason = "当前授权缺少表格或 Drive 权限，需重新勾选权限登录"
-
-            if need_browser:
-                auth_mode = "browser"
-                flow = InstalledAppFlow.from_client_secrets_file(credentials_path, SCOPES)
-                creds = flow.run_local_server(
-                    port=0,
-                    access_type="offline",
-                    prompt="consent",
-                    open_browser=True,
-                )
-                if not getattr(creds, "refresh_token", None) and os.path.exists(token_path):
+            # OAuth：token 读写加锁，避免多线程上传时互相刷新把授权弄失效
+            with _TOKEN_IO_LOCK:
+                creds = None
+                load_error = ""
+                if os.path.exists(token_path):
                     try:
-                        with open(token_path, "r", encoding="utf-8") as oldf:
-                            old = json.load(oldf)
-                        if old.get("refresh_token"):
-                            creds = Credentials(
-                                token=creds.token,
-                                refresh_token=old.get("refresh_token"),
-                                token_uri=creds.token_uri,
-                                client_id=creds.client_id,
-                                client_secret=creds.client_secret,
-                                scopes=list(creds.scopes) if creds.scopes else list(SCOPES),
-                            )
-                    except Exception:
-                        pass
+                        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+                    except Exception as exc:
+                        load_error = str(exc)
+                        creds = None
 
-            # 持久化：失败要让用户知道，否则会“每次都要授权”
-            try:
-                save_user_token(creds, token_path)
-            except Exception as save_exc:
-                raise RuntimeError(
-                    f"授权成功但无法保存到本机，下次仍会要求重新登录。\n"
-                    f"路径：{token_path}\n"
-                    f"原因：{save_exc}\n"
-                    f"请检查该目录写入权限，或关闭占用 token.json 的杀毒软件。"
-                ) from save_exc
+                need_browser = False
+                reauth_reason = ""
+                auth_mode = "reuse"
 
-            self.creds = creds
-            if auth_mode == "browser":
-                self.account_label = "OAuth 用户（刚重新登录）"
-            elif auth_mode == "refresh":
-                self.account_label = "OAuth 用户（已自动续期）"
-            else:
-                self.account_label = "OAuth 用户（复用本机授权）"
-            self.auth_mode = auth_mode
-            self.auth_token_path = token_path
-            self._auth_reauth_reason = reauth_reason if need_browser else ""
+                if not creds:
+                    need_browser = True
+                    reauth_reason = load_error or f"未找到授权文件：{token_path}"
+                else:
+                    if not creds.valid:
+                        if not creds.refresh_token:
+                            need_browser = True
+                            reauth_reason = "授权文件缺少 refresh_token，需重新登录一次以获取长期授权"
+                        else:
+                            try:
+                                creds.refresh(GoogleAuthRequest())
+                                auth_mode = "refresh"
+                                try:
+                                    save_user_token(creds, token_path)
+                                except Exception:
+                                    pass
+                            except Exception as refresh_exc:
+                                if is_transient_network_error(refresh_exc):
+                                    raise RuntimeError(friendly_network_error(refresh_exc)) from refresh_exc
+                                need_browser = True
+                                reauth_reason = f"刷新授权失败，需要重新登录：{refresh_exc}"
+
+                    if not need_browser:
+                        scopes_ok = scopes_cover_required(getattr(creds, "scopes", None))
+                        if not scopes_ok:
+                            scopes_ok = token_has_required_scopes(token_path)
+                        if not scopes_ok:
+                            need_browser = True
+                            reauth_reason = "当前授权缺少表格或 Drive 权限，需重新勾选权限登录"
+
+                if need_browser:
+                    if not allow_browser:
+                        raise RuntimeError(
+                            "后台线程需要 Google 授权，但禁止弹浏览器。\n"
+                            f"原因：{reauth_reason or '未知'}\n"
+                            "请先在主界面任意「加载表格/分类」完成一次登录后再上传。"
+                        )
+                    auth_mode = "browser"
+                    flow = InstalledAppFlow.from_client_secrets_file(credentials_path, SCOPES)
+                    creds = flow.run_local_server(
+                        port=0,
+                        access_type="offline",
+                        prompt="consent",
+                        open_browser=True,
+                    )
+                    if not getattr(creds, "refresh_token", None) and os.path.exists(token_path):
+                        try:
+                            with open(token_path, "r", encoding="utf-8") as oldf:
+                                old = json.load(oldf)
+                            if old.get("refresh_token"):
+                                creds = Credentials(
+                                    token=creds.token,
+                                    refresh_token=old.get("refresh_token"),
+                                    token_uri=creds.token_uri,
+                                    client_id=creds.client_id,
+                                    client_secret=creds.client_secret,
+                                    scopes=list(creds.scopes) if creds.scopes else list(SCOPES),
+                                )
+                        except Exception:
+                            pass
+
+                try:
+                    save_user_token(creds, token_path)
+                except Exception as save_exc:
+                    raise RuntimeError(
+                        f"授权成功但无法保存到本机，下次仍会要求重新登录。\n"
+                        f"路径：{token_path}\n"
+                        f"原因：{save_exc}\n"
+                        f"请检查该目录写入权限，或关闭占用 token.json 的杀毒软件。"
+                    ) from save_exc
+
+                self.creds = creds
+                if auth_mode == "browser":
+                    self.account_label = "OAuth 用户（刚重新登录）"
+                elif auth_mode == "refresh":
+                    self.account_label = "OAuth 用户（已自动续期）"
+                else:
+                    self.account_label = "OAuth 用户（复用本机授权）"
+                self.auth_mode = auth_mode
+                self.auth_token_path = token_path
+                self._auth_reauth_reason = reauth_reason if need_browser else ""
 
         self.sheets = build("sheets", "v4", credentials=self.creds)
         self.drive = build("drive", "v3", credentials=self.creds)
@@ -1107,46 +1119,47 @@ class GoogleClient:
         return sheet_id
 
     def insert_inbound_row(self, spreadsheet_id: str, sheet_name: str, row_values, insert_before_row: int = 7):
-        """在指定行上方插入一行并写入入库数据。"""
-        self.ensure_sheet(spreadsheet_id, sheet_name)
-        sheet_id = self.get_sheet_id(spreadsheet_id, sheet_name)
+        """在指定行上方插入一行并写入入库数据（全局锁，禁止多线程并发插行）。"""
+        with _SHEETS_WRITE_LOCK:
+            self.ensure_sheet(spreadsheet_id, sheet_name)
+            sheet_id = self.get_sheet_id(spreadsheet_id, sheet_name)
 
-        index = max(0, int(insert_before_row) - 1)
-        self.sheets.spreadsheets().batchUpdate(
-            spreadsheetId=spreadsheet_id,
-            body={
-                "requests": [{
-                    "insertDimension": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "dimension": "ROWS",
-                            "startIndex": index,
-                            "endIndex": index + 1,
-                        },
-                        "inheritFromBefore": False,
-                    }
-                }]
-            },
-        ).execute()
-        cell = f"{quote_sheet_name(sheet_name)}!A{insert_before_row}"
-        self.sheets.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id,
-            range=cell,
-            valueInputOption="USER_ENTERED",
-            body={"values": [list(row_values)]},
-        ).execute()
+            index = max(0, int(insert_before_row) - 1)
+            self.sheets.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={
+                    "requests": [{
+                        "insertDimension": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "dimension": "ROWS",
+                                "startIndex": index,
+                                "endIndex": index + 1,
+                            },
+                            "inheritFromBefore": False,
+                        }
+                    }]
+                },
+            ).execute()
+            cell = f"{quote_sheet_name(sheet_name)}!A{insert_before_row}"
+            self.sheets.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range=cell,
+                valueInputOption="USER_ENTERED",
+                body={"values": [list(row_values)]},
+            ).execute()
 
     def append_upload_log(self, spreadsheet_id: str, sheet_name: str, level: str, message: str):
-        self.ensure_sheet(spreadsheet_id, sheet_name, headers=["时间戳", "日志级别", "详细信息"])
-        # 若只有表头或空，直接 append
-        ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        self.sheets.spreadsheets().values().append(
-            spreadsheetId=spreadsheet_id,
-            range=f"{quote_sheet_name(sheet_name)}!A:C",
-            valueInputOption="USER_ENTERED",
-            insertDataOption="INSERT_ROWS",
-            body={"values": [[ts, level, message]]},
-        ).execute()
+        with _SHEETS_WRITE_LOCK:
+            self.ensure_sheet(spreadsheet_id, sheet_name, headers=["时间戳", "日志级别", "详细信息"])
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            self.sheets.spreadsheets().values().append(
+                spreadsheetId=spreadsheet_id,
+                range=f"{quote_sheet_name(sheet_name)}!A:C",
+                valueInputOption="USER_ENTERED",
+                insertDataOption="INSERT_ROWS",
+                body={"values": [[ts, level, message]]},
+            ).execute()
 
 
 class PublicDownloader:
